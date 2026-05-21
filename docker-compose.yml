@@ -1,0 +1,21 @@
+services:
+  go-home-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: go-home-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080/tcp"
+    environment:
+      GO_HOME_ADDR: ":8080"
+      GO_HOME_DB: "/data/go-home.db"
+      GO_HOME_WEB_DIST: "/app/web-console"
+      GO_HOME_DEFAULT_ADMIN_PASSWORD: "admin"
+      GO_HOME_DEFAULT_AUTH_CODE: "GOHOME-CHANGE-ME"
+    volumes:
+      - go-home-data:/data
+
+volumes:
+  go-home-data:
+
