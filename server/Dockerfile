@@ -15,7 +15,7 @@ WORKDIR /src/server
 RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/go-home-server ./cmd/server
 
-FROM gcr.io/distroless/static-debian12
+FROM scratch
 WORKDIR /app
 COPY --from=build /out/go-home-server /app/go-home-server
 COPY --from=web /src/web-console/dist /app/web-console
