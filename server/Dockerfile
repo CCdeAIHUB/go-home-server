@@ -9,6 +9,7 @@ RUN npm run build
 FROM golang:1.25 AS build
 
 WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
 COPY shared/go ./shared/go
 COPY server ./server
 WORKDIR /src/server
