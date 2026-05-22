@@ -430,6 +430,7 @@ func (h *Hub) deviceLANReport(s *Session, env protocol.Envelope) protocol.Envelo
 		return protocol.Error(env.ID, "internal_error", err.Error())
 	}
 	h.store.AddLog("info", "lan", "家庭服务器上报网段: "+params.LANCIDR)
+	h.familyLANChanged(s.deviceID, params.LANCIDR)
 	h.dataChanged("device.lan_report")
 	return protocol.Result(env.ID, ok())
 }
@@ -668,6 +669,50 @@ func (h *Hub) dataChanged(reason string) {
 	h.mu.RUnlock()
 	if admin != nil {
 		admin.write(event)
+	}
+}
+
+func (h *Hub) familyLANChanged(homeServerID, cidr string) {
+	families, err := h.store.ListFamilies()
+	if err != nil {
+		log.Printf("list families for LAN change: %v", err)
+		return
+	}
+	var family protocol.Family
+	for _, candidate := range families {
+		if candidate.HomeServerID == homeServerID {
+			family = candidate
+			break
+		}
+	}
+	if family.ID == 0 {
+		return
+	}
+	event, err := protocol.Event(protocol.EventFamilyLANChanged, map[string]any{
+		"family_id": family.ID,
+		"lan_cidr":  cidr,
+	})
+	if err != nil {
+		return
+	}
+
+	h.mu.RLock()
+	sessions := make([]*Session, 0, len(h.devices))
+	for _, session := range h.devices {
+		if session.kind == protocol.DeviceTypeClient {
+			sessions = append(sessions, session)
+		}
+	}
+	h.mu.RUnlock()
+	for _, session := range sessions {
+		allowed, err := h.store.CanDeviceAccessFamily(session.deviceID, family.ID)
+		if err != nil {
+			log.Printf("LAN change access check for %s: %v", session.deviceID, err)
+			continue
+		}
+		if allowed {
+			session.write(event)
+		}
 	}
 }
 
