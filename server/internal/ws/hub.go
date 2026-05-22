@@ -283,7 +283,7 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 	case protocol.ActionStatsLatencyPong:
 		return h.latencyPong(s, env)
 	case protocol.ActionPing:
-		return protocol.Result(env.ID, map[string]any{"pong": true, "server_now": time.Now(), "latency_ms": s.currentLatency()})
+		return h.ping(s, env)
 	default:
 		return protocol.Error(env.ID, "unknown_action", "unknown action")
 	}
@@ -346,16 +346,8 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	if params.AuthCode != authCode {
 		return protocol.Error(env.ID, "unauthorized", "authorization code is incorrect")
 	}
-	validTime, skew := security.ValidateTimeKey(authCode, params.TimeKey, params.Timestamp, time.Now(), 2)
-	if !validTime {
-		s.failures++
-		if s.failures >= 3 {
-			_ = s.conn.Close()
-		}
-		if skew {
-			return protocol.Error(env.ID, "clock_skew", "time check failed, please check system time")
-		}
-		return protocol.Error(env.ID, "time_key_invalid", "time key invalid")
+	if reply := validateTimeKey(s, env.ID, authCode, params.TimeKey, params.Timestamp); reply != nil {
+		return *reply
 	}
 	token, err := security.NewToken(16)
 	if err != nil {
@@ -386,6 +378,44 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 		DeviceID:   params.DeviceID,
 		DeviceType: params.DeviceType,
 	})
+}
+
+func (h *Hub) ping(s *Session, env protocol.Envelope) protocol.Envelope {
+	if s.deviceID != "" {
+		params, err := protocol.DecodeParams[protocol.HeartbeatParams](env.Params)
+		if err != nil {
+			return protocol.Error(env.ID, "bad_request", err.Error())
+		}
+		authCode, err := h.store.GetConfig(store.ConfigAuthCode)
+		if err != nil {
+			return protocol.Error(env.ID, "internal_error", err.Error())
+		}
+		if reply := validateTimeKey(s, env.ID, authCode, params.TimeKey, params.Timestamp); reply != nil {
+			return *reply
+		}
+		if err := h.store.TouchDevice(s.deviceID); err != nil {
+			return protocol.Error(env.ID, "internal_error", err.Error())
+		}
+	}
+	return protocol.Result(env.ID, map[string]any{"pong": true, "server_now": time.Now(), "latency_ms": s.currentLatency()})
+}
+
+func validateTimeKey(s *Session, envID, secret, timeKey string, timestamp int64) *protocol.Envelope {
+	validTime, skew := security.ValidateTimeKey(secret, timeKey, timestamp, time.Now(), 2)
+	if validTime {
+		s.failures = 0
+		return nil
+	}
+	s.failures++
+	if s.failures >= 3 && s.conn != nil {
+		_ = s.conn.Close()
+	}
+	if skew {
+		reply := protocol.Error(envID, "clock_skew", "time check failed, please check system time")
+		return &reply
+	}
+	reply := protocol.Error(envID, "time_key_invalid", "time key invalid")
+	return &reply
 }
 
 func (h *Hub) deviceLANReport(s *Session, env protocol.Envelope) protocol.Envelope {
