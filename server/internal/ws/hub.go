@@ -426,11 +426,14 @@ func (h *Hub) deviceLANReport(s *Session, env protocol.Envelope) protocol.Envelo
 	if err != nil {
 		return protocol.Error(env.ID, "bad_request", err.Error())
 	}
-	if err := h.store.UpdateLAN(s.deviceID, params.LANCIDR); err != nil {
+	changed, err := h.store.UpdateLAN(s.deviceID, params.LANCIDR)
+	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
 	}
 	h.store.AddLog("info", "lan", "家庭服务器上报网段: "+params.LANCIDR)
-	h.familyLANChanged(s.deviceID, params.LANCIDR)
+	if changed {
+		h.familyLANChanged(s.deviceID, params.LANCIDR)
+	}
 	h.dataChanged("device.lan_report")
 	return protocol.Result(env.ID, ok())
 }

@@ -181,9 +181,13 @@ func (s *Store) SetBlacklisted(deviceID string, value bool) error {
 	return err
 }
 
-func (s *Store) UpdateLAN(deviceID, cidr string) error {
+func (s *Store) UpdateLAN(deviceID, cidr string) (bool, error) {
+	var previous string
+	if err := s.db.QueryRow(`SELECT COALESCE(lan_cidr, '') FROM devices WHERE device_id = ?`, deviceID).Scan(&previous); err != nil {
+		return false, err
+	}
 	_, err := s.db.Exec(`UPDATE devices SET lan_cidr = ?, lan_updated_at = CURRENT_TIMESTAMP WHERE device_id = ?`, cidr, deviceID)
-	return err
+	return previous != cidr, err
 }
 
 func (s *Store) CreateFamily(name, visibility string) (int64, error) {
