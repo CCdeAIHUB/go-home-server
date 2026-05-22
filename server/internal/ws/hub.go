@@ -33,6 +33,7 @@ type Session struct {
 	kind      string
 	deviceID  string
 	token     string
+	publicKey string
 	udpPort   int
 	remote    string
 	failures  int
@@ -368,6 +369,7 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	s.kind = params.DeviceType
 	s.deviceID = params.DeviceID
 	s.token = token
+	s.publicKey = params.PublicKey
 	s.udpPort = params.UDPPort
 	if old := h.devices[params.DeviceID]; old != nil && old != s {
 		_ = old.conn.Close()
@@ -422,6 +424,13 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 	if err != nil {
 		return protocol.Error(env.ID, "bad_request", err.Error())
 	}
+	allowed, err := h.store.CanDeviceAccessFamily(s.deviceID, params.FamilyID)
+	if err != nil {
+		return protocol.Error(env.ID, "internal_error", err.Error())
+	}
+	if !allowed {
+		return protocol.Error(env.ID, "forbidden", "client cannot access family")
+	}
 	home, err := h.store.GetFamilyHomeServer(params.FamilyID)
 	if err != nil {
 		return protocol.Error(env.ID, "not_available", "family has no bound home server")
@@ -432,10 +441,34 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 	if homeSession == nil {
 		return protocol.Error(env.ID, "not_available", "home server is offline")
 	}
+	if homeSession.publicKey == "" {
+		return protocol.Error(env.ID, "not_available", "home server has no SM2 public key")
+	}
+	sessionID, err := security.NewToken(16)
+	if err != nil {
+		return protocol.Error(env.ID, "internal_error", err.Error())
+	}
 
-	client := protocol.PeerCandidate{DeviceID: s.deviceID, Endpoint: peerEndpoint(s), UDPPort: s.udpPort}
-	server := protocol.PeerCandidate{DeviceID: home.DeviceID, Endpoint: peerEndpoint(homeSession), UDPPort: homeSession.udpPort, LANCIDR: home.LANCIDR}
-	offer := protocol.HolePunchOffer{FamilyID: params.FamilyID, Client: client, Server: server}
+	client := protocol.PeerCandidate{
+		DeviceID:  s.deviceID,
+		Endpoint:  peerEndpoint(s),
+		UDPPort:   s.udpPort,
+		PublicKey: s.publicKey,
+	}
+	server := protocol.PeerCandidate{
+		DeviceID:  home.DeviceID,
+		Endpoint:  peerEndpoint(homeSession),
+		UDPPort:   homeSession.udpPort,
+		LANCIDR:   home.LANCIDR,
+		PublicKey: homeSession.publicKey,
+	}
+	offer := protocol.HolePunchOffer{
+		SessionID: sessionID,
+		FamilyID:  params.FamilyID,
+		Request:   params,
+		Client:    client,
+		Server:    server,
+	}
 	if event, err := protocol.Event(protocol.EventP2PHolePunchOffer, offer); err == nil {
 		homeSession.write(event)
 	}

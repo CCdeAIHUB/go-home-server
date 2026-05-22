@@ -286,6 +286,26 @@ ORDER BY f.created_at DESC
 	return scanFamilies(rows, nil)
 }
 
+func (s *Store) CanDeviceAccessFamily(deviceID string, familyID int64) (bool, error) {
+	var allowed bool
+	err := s.db.QueryRow(`
+SELECT EXISTS (
+  SELECT 1
+  FROM families f
+  WHERE f.id = ?
+    AND (
+      f.visibility = 'public'
+      OR EXISTS (
+        SELECT 1
+        FROM family_device_grants g
+        WHERE g.family_id = f.id AND g.device_id = ?
+      )
+    )
+)
+`, familyID, deviceID).Scan(&allowed)
+	return allowed, err
+}
+
 func (s *Store) ListFamilies() ([]protocol.Family, error) {
 	rows, err := s.db.Query(`
 SELECT f.id, f.name, f.visibility, f.created_at, COALESCE(f.home_server_id, ''),
