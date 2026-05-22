@@ -1,3 +1,9 @@
+// Package ws 实现了公网服务器的 WebSocket Hub，负责：
+//   - 管理所有 WebSocket 连接会话（管理员控制台 + 设备端）
+//   - 路由 JSON-RPC 2.0 请求到对应的处理函数
+//   - 转发 P2P 打洞信令和候选地址
+//   - 推送服务器事件（数据变更、延迟探测、强制下线等）
+//   - 维护在线设备状态和延迟信息
 package ws
 
 import (
@@ -16,36 +22,62 @@ import (
 	"gohome/shared/security"
 )
 
+// Hub 是 WebSocket 连接的中心管理器，维护所有活跃会话。
+// 管理员（Web 控制台）最多同时只有一个活跃会话（单点登录）。
+// 设备端按 device_id 索引，同一设备的新连接会顶替旧连接。
 type Hub struct {
-	store    *store.Store
-	started  time.Time
+	// store 数据持久层引用。
+	store *store.Store
+	// started 服务器启动时间，用于计算运行时长。
+	started time.Time
+	// upgrader WebSocket 升级器。
 	upgrader websocket.Upgrader
 
-	mu      sync.RWMutex
-	admin   *Session
+	// mu 保护 admin 和 devices 的并发访问。
+	mu sync.RWMutex
+	// admin 当前活跃的管理员会话，nil 表示未登录。
+	admin *Session
+	// devices 在线设备会话映射，key 为 device_id。
 	devices map[string]*Session
 }
 
+// Session 表示一个 WebSocket 连接会话。
+// 每个会话可能属于管理员（Web 控制台）或设备（客户端/家庭服务器）。
 type Session struct {
-	conn      *websocket.Conn
-	mu        sync.Mutex
-	probeMu   sync.Mutex
-	kind      string
-	deviceID  string
-	token     string
+	// conn 底层 WebSocket 连接。
+	conn *websocket.Conn
+	// mu 保护 conn 的并发写入（WebSocket 不支持并发写）。
+	mu sync.Mutex
+	// probeMu 保护 probes 和 latencyMS 的并发访问。
+	probeMu sync.Mutex
+	// kind 会话类型，对应 protocol.DeviceType* 常量。空字符串表示未认证。
+	kind string
+	// deviceID 设备唯一标识，认证后设置。
+	deviceID string
+	// token 认证令牌，用于后续请求校验。
+	token string
+	// publicKey 设备的 SM2 公钥（PEM 格式），用于 P2P 密钥交换。
 	publicKey string
-	udpPort   int
-	remote    string
-	failures  int
-	probes    map[string]time.Time
+	// udpPort 设备监听的 UDP 端口，用于 P2P 打洞。
+	udpPort int
+	// remote 客户端远程地址（host:port），用于 P2P 端点推断。
+	remote string
+	// failures 连续 time_key 校验失败次数，达到 3 次强制断开连接。
+	failures int
+	// probes 延迟探测映射，key 为 probe_id，value 为发送时间。
+	probes map[string]time.Time
+	// latencyMS 最近一次测量的延迟（毫秒）。
 	latencyMS int64
 }
 
+// NewHub 创建一个新的 Hub 实例并启动延迟探测循环。
 func NewHub(s *store.Store) *Hub {
 	h := &Hub{
 		store:   s,
 		started: time.Now(),
 		upgrader: websocket.Upgrader{
+			// 允许所有来源的 WebSocket 连接。
+			// 生产环境应验证 Origin 头，防止 CSRF 攻击。
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
 		devices: map[string]*Session{},
@@ -54,6 +86,8 @@ func NewHub(s *store.Store) *Hub {
 	return h
 }
 
+// ServeHTTP 处理 WebSocket 升级请求，进入消息读取循环。
+// 连接断开后自动清理会话资源。
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -66,6 +100,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		var env protocol.Envelope
 		if err := conn.ReadJSON(&env); err != nil {
+			// 读取失败（连接关闭或格式错误），退出循环触发 closeSession。
 			return
 		}
 		reply := h.handle(session, env)
@@ -75,8 +110,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handle 将 JSON-RPC 请求路由到对应的处理函数。
+// 返回的 Envelope 作为响应发送回客户端。
 func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 	switch env.Action {
+	// ===== 管理控制台操作（需要管理员登录）=====
 	case protocol.ActionFrontLogin:
 		return h.frontLogin(s, env)
 	case protocol.ActionFrontDashboard:
@@ -129,7 +167,7 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 		})
 	case protocol.ActionFrontFamilyUnbindServer:
 		return h.requireAdmin(s, env, func() (any, error) {
-			params, err := protocol.DecodeParams[protocol.BindHomeServerParams](env.Params)
+			params, err := protocol.DecodeParams[protocol.UnbindHomeServerParams](env.Params)
 			if err != nil {
 				return nil, err
 			}
@@ -155,7 +193,7 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 		})
 	case protocol.ActionFrontFamilyRevokeDevice:
 		return h.requireAdmin(s, env, func() (any, error) {
-			params, err := protocol.DecodeParams[protocol.FamilyGrantParams](env.Params)
+			params, err := protocol.DecodeParams[protocol.FamilyRevokeParams](env.Params)
 			if err != nil {
 				return nil, err
 			}
@@ -185,9 +223,8 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 				return nil, err
 			}
 			if params.Value {
+				// 拉黑后立即强制设备下线
 				h.forceOffline(params.DeviceID, "blacklisted")
-			}
-			if params.Value {
 				h.store.AddLog("warn", "device", "设备已拉黑: "+params.DeviceID)
 			} else {
 				h.store.AddLog("info", "device", "设备已解除拉黑: "+params.DeviceID)
@@ -208,17 +245,10 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 		})
 	case protocol.ActionFrontLogList:
 		return h.requireAdmin(s, env, func() (any, error) {
-			var params struct {
-				Limit int `json:"limit"`
-			}
-			if len(env.Params) > 0 {
-				decoded, err := protocol.DecodeParams[struct {
-					Limit int `json:"limit"`
-				}](env.Params)
-				if err != nil {
-					return nil, err
-				}
-				params = decoded
+			params, err := protocol.DecodeParams[protocol.LogListParams](env.Params)
+			if err != nil {
+				// 参数解析失败时使用默认 limit
+				params.Limit = 0
 			}
 			return h.store.ListLogs(params.Limit)
 		})
@@ -232,11 +262,12 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 		})
 	case protocol.ActionFrontConfigUpdateAuth:
 		return h.requireAdmin(s, env, func() (any, error) {
-			params, err := protocol.DecodeParams[struct {
-				AuthCode string `json:"auth_code"`
-			}](env.Params)
+			params, err := protocol.DecodeParams[protocol.ConfigUpdateAuthParams](env.Params)
 			if err != nil {
 				return nil, err
+			}
+			if params.AuthCode == "" {
+				return nil, errors.New("auth_code cannot be empty")
 			}
 			if err := h.store.SetConfig(store.ConfigAuthCode, params.AuthCode); err != nil {
 				return nil, err
@@ -247,12 +278,12 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 		})
 	case protocol.ActionFrontConfigUpdatePass:
 		return h.requireAdmin(s, env, func() (any, error) {
-			params, err := protocol.DecodeParams[struct {
-				OldPassword string `json:"old_password"`
-				NewPassword string `json:"new_password"`
-			}](env.Params)
+			params, err := protocol.DecodeParams[protocol.ConfigUpdatePassParams](env.Params)
 			if err != nil {
 				return nil, err
+			}
+			if params.NewPassword == "" {
+				return nil, errors.New("new password cannot be empty")
 			}
 			okPassword, err := h.store.CheckAdminPassword(params.OldPassword)
 			if err != nil {
@@ -268,6 +299,8 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 			h.dataChanged("config.password")
 			return ok(), nil
 		})
+
+	// ===== 设备端操作 =====
 	case protocol.ActionDeviceAuth:
 		return h.deviceAuth(s, env)
 	case protocol.ActionDeviceLANReport:
@@ -284,11 +317,19 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 		return h.latencyPong(s, env)
 	case protocol.ActionPing:
 		return h.ping(s, env)
+
 	default:
-		return protocol.Error(env.ID, "unknown_action", "unknown action")
+		return protocol.Error(env.ID, "unknown_action", "unknown action: "+env.Action)
 	}
 }
 
+// ============================================================
+// 管理控制台操作
+// ============================================================
+
+// frontLogin 处理管理员登录请求。
+// 实现单点登录：新登录会踢掉旧的管理员会话。
+// 登录成功后返回 token，后续管理请求需校验此 token。
 func (h *Hub) frontLogin(s *Session, env protocol.Envelope) protocol.Envelope {
 	params, err := protocol.DecodeParams[protocol.LoginParams](env.Params)
 	if err != nil {
@@ -307,6 +348,7 @@ func (h *Hub) frontLogin(s *Session, env protocol.Envelope) protocol.Envelope {
 	}
 
 	h.mu.Lock()
+	// 踢掉旧的管理员会话（单点登录）
 	if h.admin != nil && h.admin != s {
 		if event, err := protocol.Event(protocol.EventFrontSessionRevoked, map[string]any{"reason": "账号在别处登录"}); err == nil {
 			h.admin.write(event)
@@ -324,6 +366,13 @@ func (h *Hub) frontLogin(s *Session, env protocol.Envelope) protocol.Envelope {
 	return protocol.Result(env.ID, protocol.LoginResult{Token: token})
 }
 
+// ============================================================
+// 设备认证与心跳
+// ============================================================
+
+// deviceAuth 处理设备认证请求。
+// 校验流程：1) 检查必填字段；2) 验证设备类型合法性；3) 检查黑名单；
+// 4) 验证授权码；5) 校验 time_key（防重放）；6) 注册或更新设备信息。
 func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	params, err := protocol.DecodeParams[protocol.DeviceAuthParams](env.Params)
 	if err != nil {
@@ -331,6 +380,10 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	}
 	if params.DeviceID == "" || params.DeviceType == "" {
 		return protocol.Error(env.ID, "bad_request", "device_id and device_type are required")
+	}
+	// 校验设备类型合法性
+	if params.DeviceType != protocol.DeviceTypeClient && params.DeviceType != protocol.DeviceTypeHomeServer {
+		return protocol.Error(env.ID, "bad_request", "device_type must be 'client' or 'home-server'")
 	}
 	blacklisted, err := h.store.IsBlacklisted(params.DeviceID)
 	if err != nil {
@@ -346,6 +399,7 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	if params.AuthCode != authCode {
 		return protocol.Error(env.ID, "unauthorized", "authorization code is incorrect")
 	}
+	// 校验 time_key（基于 SM3-HMAC 的时间窗口密钥，防重放攻击）
 	if reply := validateTimeKey(s, env.ID, authCode, params.TimeKey, params.Timestamp); reply != nil {
 		return *reply
 	}
@@ -363,6 +417,7 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	s.token = token
 	s.publicKey = params.PublicKey
 	s.udpPort = params.UDPPort
+	// 同一设备的新连接顶替旧连接（单设备单会话）
 	if old := h.devices[params.DeviceID]; old != nil && old != s {
 		_ = old.conn.Close()
 	}
@@ -380,6 +435,8 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	})
 }
 
+// ping 处理设备心跳请求。
+// 已认证设备需携带 time_key 进行校验，同时更新最后在线时间。
 func (h *Hub) ping(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID != "" {
 		params, err := protocol.DecodeParams[protocol.HeartbeatParams](env.Params)
@@ -400,6 +457,9 @@ func (h *Hub) ping(s *Session, env protocol.Envelope) protocol.Envelope {
 	return protocol.Result(env.ID, map[string]any{"pong": true, "server_now": time.Now(), "latency_ms": s.currentLatency()})
 }
 
+// validateTimeKey 校验请求中的 time_key 和 timestamp。
+// secret 为用于生成 time_key 的密钥（设备使用 auth_code）。
+// 连续 3 次校验失败将强制断开连接，防止暴力破解。
 func validateTimeKey(s *Session, envID, secret, timeKey string, timestamp int64) *protocol.Envelope {
 	validTime, skew := security.ValidateTimeKey(secret, timeKey, timestamp, time.Now(), 2)
 	if validTime {
@@ -408,6 +468,7 @@ func validateTimeKey(s *Session, envID, secret, timeKey string, timestamp int64)
 	}
 	s.failures++
 	if s.failures >= 3 && s.conn != nil {
+		// 连续 3 次失败，强制断开连接
 		_ = s.conn.Close()
 	}
 	if skew {
@@ -418,6 +479,12 @@ func validateTimeKey(s *Session, envID, secret, timeKey string, timestamp int64)
 	return &reply
 }
 
+// ============================================================
+// 设备操作
+// ============================================================
+
+// deviceLANReport 处理家庭服务器的局域网网段上报。
+// 仅家庭服务器可调用。当网段发生变化时，通知所有相关客户端。
 func (h *Hub) deviceLANReport(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" || s.kind != protocol.DeviceTypeHomeServer {
 		return protocol.Error(env.ID, "unauthorized", "home server auth required")
@@ -438,6 +505,8 @@ func (h *Hub) deviceLANReport(s *Session, env protocol.Envelope) protocol.Envelo
 	return protocol.Result(env.ID, ok())
 }
 
+// clientFamilyList 处理客户端获取可访问家庭列表的请求。
+// 返回公开家庭 + 该客户端被授权访问的私密家庭。
 func (h *Hub) clientFamilyList(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" || s.kind != protocol.DeviceTypeClient {
 		return protocol.Error(env.ID, "unauthorized", "client auth required")
@@ -450,6 +519,9 @@ func (h *Hub) clientFamilyList(s *Session, env protocol.Envelope) protocol.Envel
 	return protocol.Result(env.ID, families)
 }
 
+// holePunchRequest 处理客户端的 P2P 打洞请求。
+// 流程：1) 校验客户端权限；2) 查找目标家庭服务器；3) 生成打洞会话 ID；
+// 4) 构建打洞邀请（含双方连接信息）；5) 转发给家庭服务器；6) 返回给客户端。
 func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" || s.kind != protocol.DeviceTypeClient {
 		return protocol.Error(env.ID, "unauthorized", "client auth required")
@@ -483,6 +555,7 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		return protocol.Error(env.ID, "internal_error", err.Error())
 	}
 
+	// 构建双方的连接信息
 	client := protocol.PeerCandidate{
 		DeviceID:  s.deviceID,
 		Endpoint:  peerEndpoint(s),
@@ -503,6 +576,7 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		Client:    client,
 		Server:    server,
 	}
+	// 将打洞邀请转发给家庭服务器
 	if event, err := protocol.Event(protocol.EventP2PHolePunchOffer, offer); err == nil {
 		homeSession.write(event)
 	}
@@ -511,6 +585,8 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 	return protocol.Result(env.ID, offer)
 }
 
+// candidateRelay 处理候选地址转发请求。
+// 一端发现新的候选地址后，通过服务器中继转发给对端。
 func (h *Hub) candidateRelay(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" {
 		return protocol.Error(env.ID, "unauthorized", "device auth required")
@@ -535,6 +611,7 @@ func (h *Hub) candidateRelay(s *Session, env protocol.Envelope) protocol.Envelop
 	return protocol.Result(env.ID, ok())
 }
 
+// trafficReport 处理设备流量上报。
 func (h *Hub) trafficReport(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" {
 		return protocol.Error(env.ID, "unauthorized", "device auth required")
@@ -550,6 +627,8 @@ func (h *Hub) trafficReport(s *Session, env protocol.Envelope) protocol.Envelope
 	return protocol.Result(env.ID, ok())
 }
 
+// latencyPong 处理设备回复的延迟探测。
+// 根据 probe_id 找到对应的探测开始时间，计算延迟。
 func (h *Hub) latencyPong(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" {
 		return protocol.Error(env.ID, "unauthorized", "device auth required")
@@ -559,21 +638,37 @@ func (h *Hub) latencyPong(s *Session, env protocol.Envelope) protocol.Envelope {
 		return protocol.Error(env.ID, "bad_request", err.Error())
 	}
 	s.probeMu.Lock()
-	started, ok := s.probes[params.ProbeID]
-	if ok {
+	started, found := s.probes[params.ProbeID]
+	if found {
 		delete(s.probes, params.ProbeID)
 		s.latencyMS = time.Since(started).Milliseconds()
 	}
 	s.probeMu.Unlock()
-	if ok {
+	if found {
 		h.dataChanged("stats.latency")
 	}
 	return protocol.Result(env.ID, map[string]any{"latency_ms": s.currentLatency()})
 }
 
+// ============================================================
+// 权限校验
+// ============================================================
+
+// requireAdmin 校验管理员权限后执行回调函数。
+// 仅当会话类型为 web-console 且 token 匹配时允许执行。
 func (h *Hub) requireAdmin(s *Session, env protocol.Envelope, fn func() (any, error)) protocol.Envelope {
 	if s.kind != protocol.DeviceTypeConsole {
 		return protocol.Error(env.ID, "unauthorized", "admin login required")
+	}
+	// 校验管理员 token，防止会话伪造
+	h.mu.RLock()
+	expectedToken := ""
+	if h.admin != nil {
+		expectedToken = h.admin.token
+	}
+	h.mu.RUnlock()
+	if s.token != expectedToken || s.token == "" {
+		return protocol.Error(env.ID, "unauthorized", "invalid admin session token")
 	}
 	result, err := fn()
 	if err != nil {
@@ -582,6 +677,12 @@ func (h *Hub) requireAdmin(s *Session, env protocol.Envelope, fn func() (any, er
 	return protocol.Result(env.ID, result)
 }
 
+// ============================================================
+// 会话管理与事件推送
+// ============================================================
+
+// closeSession 清理断开连接的会话资源。
+// 如果是管理员会话则清除 admin 引用，如果是设备会话则从 devices 映射中移除。
 func (h *Hub) closeSession(s *Session) {
 	_ = s.conn.Close()
 	deviceID := s.deviceID
@@ -600,12 +701,14 @@ func (h *Hub) closeSession(s *Session) {
 	}
 }
 
+// onlineDeviceCount 返回当前在线设备数量。
 func (h *Hub) onlineDeviceCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.devices)
 }
 
+// familiesWithOnline 获取所有家庭列表并标记家庭服务器在线状态。
 func (h *Hub) familiesWithOnline() ([]protocol.Family, error) {
 	families, err := h.store.ListFamilies()
 	if err != nil {
@@ -615,6 +718,7 @@ func (h *Hub) familiesWithOnline() ([]protocol.Family, error) {
 	return families, nil
 }
 
+// markFamilyOnline 为家庭列表标记家庭服务器的在线状态。
 func (h *Hub) markFamilyOnline(families []protocol.Family) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -623,6 +727,7 @@ func (h *Hub) markFamilyOnline(families []protocol.Family) {
 	}
 }
 
+// markOnline 为设备列表标记在线状态和延迟信息。
 func (h *Hub) markOnline(devices []protocol.Device) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -634,6 +739,8 @@ func (h *Hub) markOnline(devices []protocol.Device) {
 	}
 }
 
+// forceOffline 强制设备下线。
+// 先发送 force_offline 事件通知设备，然后关闭其 WebSocket 连接。
 func (h *Hub) forceOffline(deviceID, reason string) {
 	h.mu.RLock()
 	target := h.devices[deviceID]
@@ -647,18 +754,22 @@ func (h *Hub) forceOffline(deviceID, reason string) {
 	_ = target.conn.Close()
 }
 
+// write 向 WebSocket 连接写入一条消息（线程安全）。
 func (s *Session) write(env protocol.Envelope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_ = s.conn.WriteJSON(env)
 }
 
+// currentLatency 返回当前延迟值（毫秒）。
 func (s *Session) currentLatency() int64 {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
 	return s.latencyMS
 }
 
+// dataChanged 向管理员推送数据变更事件。
+// reason 描述变更原因，前端收到后应刷新对应的数据面板。
 func (h *Hub) dataChanged(reason string) {
 	event, err := protocol.Event(protocol.EventFrontDataChanged, map[string]any{
 		"reason": reason,
@@ -675,6 +786,7 @@ func (h *Hub) dataChanged(reason string) {
 	}
 }
 
+// familyLANChanged 在家庭网段变化时通知所有有权限的客户端。
 func (h *Hub) familyLANChanged(homeServerID, cidr string) {
 	families, err := h.store.ListFamilies()
 	if err != nil {
@@ -699,6 +811,7 @@ func (h *Hub) familyLANChanged(homeServerID, cidr string) {
 		return
 	}
 
+	// 遍历所有在线客户端，检查权限后推送
 	h.mu.RLock()
 	sessions := make([]*Session, 0, len(h.devices))
 	for _, session := range h.devices {
@@ -719,6 +832,8 @@ func (h *Hub) familyLANChanged(homeServerID, cidr string) {
 	}
 }
 
+// latencyProbeLoop 定期向所有在线设备发送延迟探测。
+// 每 10 秒一轮，每个设备收到探测后应回复 stats.latency_pong。
 func (h *Hub) latencyProbeLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -735,6 +850,8 @@ func (h *Hub) latencyProbeLoop() {
 	}
 }
 
+// sendLatencyProbe 向指定会话发送一条延迟探测事件。
+// 记录发送时间，设备回复后用于计算延迟。
 func (h *Hub) sendLatencyProbe(s *Session) {
 	probeID, err := security.NewToken(8)
 	if err != nil {
@@ -745,6 +862,13 @@ func (h *Hub) sendLatencyProbe(s *Session) {
 		s.probes = map[string]time.Time{}
 	}
 	s.probes[probeID] = time.Now()
+	// 清理超过 60 秒未回复的探测记录，防止内存泄漏
+	now := time.Now()
+	for id, t := range s.probes {
+		if now.Sub(t) > 60*time.Second {
+			delete(s.probes, id)
+		}
+	}
 	s.probeMu.Unlock()
 	event, err := protocol.Event(protocol.EventDeviceLatencyProbe, map[string]any{
 		"probe_id": probeID,
@@ -756,6 +880,8 @@ func (h *Hub) sendLatencyProbe(s *Session) {
 	s.write(event)
 }
 
+// peerEndpoint 从会话中提取 P2P 端点地址。
+// 优先使用 UDP 端口组合远程 IP，否则仅使用远程 IP。
 func peerEndpoint(s *Session) string {
 	host, _, err := net.SplitHostPort(s.remote)
 	if err != nil {
@@ -767,6 +893,7 @@ func peerEndpoint(s *Session) string {
 	return net.JoinHostPort(host, strconv.Itoa(s.udpPort))
 }
 
+// ok 返回通用成功响应 {ok: true}。
 func ok() map[string]bool {
 	return map[string]bool{"ok": true}
 }

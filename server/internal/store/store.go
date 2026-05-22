@@ -1,3 +1,15 @@
+// Package store 提供公网服务器的 SQLite 数据持久层。
+//
+// 职责：
+//   - 数据库迁移与表结构管理
+//   - 系统配置的读写（管理员密码哈希、授权码）
+//   - 家庭 CRUD（创建、可见性设置、绑定/解绑家庭服务器、授权/撤销客户端）
+//   - 设备管理（注册/更新、黑名单、最后在线时间、LAN 网段）
+//   - 流量日志与服务器日志的记录和查询
+//   - 仪表盘统计数据聚合
+//
+// 注意：SQLite 使用 WAL 模式，通过 SetMaxOpenConns(1) 保证串行访问。
+// 所有写操作应通过 Hub 层调用，以确保数据变更后触发 front.data_changed 事件。
 package store
 
 import (
@@ -12,20 +24,27 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// 系统配置键名常量。
 const (
+	// ConfigAdminPassword 管理员密码哈希的配置键。
 	ConfigAdminPassword = "admin_password_hash"
-	ConfigAuthCode      = "auth_code"
+	// ConfigAuthCode 授权码的配置键。
+	ConfigAuthCode = "auth_code"
 )
 
+// Store 封装了 SQLite 数据库连接，提供所有数据访问方法。
 type Store struct {
 	db *sql.DB
 }
 
+// Open 打开或创建 SQLite 数据库，并执行表结构迁移。
+// path 为数据库文件路径，父目录必须已存在。
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
+	// SQLite 串行访问：限制最大打开连接数为 1，避免并发写入冲突。
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
@@ -35,10 +54,13 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// Close 关闭数据库连接。
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// migrate 执行数据库表结构迁移。
+// 使用 CREATE TABLE IF NOT EXISTS 保证幂等性，多次调用不会报错。
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 PRAGMA foreign_keys = ON;
@@ -99,6 +121,8 @@ CREATE TABLE IF NOT EXISTS server_logs (
 	return err
 }
 
+// InitDefaults 在首次启动时初始化默认配置值。
+// 如果数据库中已有对应配置项，则不做任何修改（幂等）。
 func (s *Store) InitDefaults(defaultPassword, defaultAuthCode string) error {
 	if _, err := s.GetConfig(ConfigAdminPassword); errors.Is(err, sql.ErrNoRows) {
 		hash, err := security.HashPassword(defaultPassword)
@@ -117,12 +141,19 @@ func (s *Store) InitDefaults(defaultPassword, defaultAuthCode string) error {
 	return nil
 }
 
+// ============================================================
+// 系统配置
+// ============================================================
+
+// GetConfig 读取系统配置项的值。
+// 如果配置项不存在，返回 sql.ErrNoRows。
 func (s *Store) GetConfig(key string) (string, error) {
 	var value string
 	err := s.db.QueryRow(`SELECT value FROM system_config WHERE key = ?`, key).Scan(&value)
 	return value, err
 }
 
+// SetConfig 写入系统配置项（upsert 语义：存在则更新，不存在则插入）。
 func (s *Store) SetConfig(key, value string) error {
 	_, err := s.db.Exec(`
 INSERT INTO system_config(key, value) VALUES(?, ?)
@@ -131,6 +162,8 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value
 	return err
 }
 
+// CheckAdminPassword 验证管理员密码是否正确。
+// 返回 true 表示密码正确，false 表示密码错误。
 func (s *Store) CheckAdminPassword(password string) (bool, error) {
 	hash, err := s.GetConfig(ConfigAdminPassword)
 	if err != nil {
@@ -139,6 +172,7 @@ func (s *Store) CheckAdminPassword(password string) (bool, error) {
 	return security.VerifyPassword(password, hash), nil
 }
 
+// UpdateAdminPassword 更新管理员密码（先哈希后存储）。
 func (s *Store) UpdateAdminPassword(password string) error {
 	hash, err := security.HashPassword(password)
 	if err != nil {
@@ -147,6 +181,13 @@ func (s *Store) UpdateAdminPassword(password string) error {
 	return s.SetConfig(ConfigAdminPassword, hash)
 }
 
+// ============================================================
+// 设备管理
+// ============================================================
+
+// UpsertDevice 注册或更新设备信息。
+// 如果设备已存在则更新类型、令牌、公钥、在线时间、UDP 端口和端点地址。
+// token 为认证成功后分配的设备令牌，endpoint 为 WebSocket 连接的远程地址。
 func (s *Store) UpsertDevice(d protocol.DeviceAuthParams, token, endpoint string) error {
 	_, err := s.db.Exec(`
 INSERT INTO devices(device_id, device_type, token, public_key, last_online, udp_port, ws_endpoint)
@@ -162,11 +203,15 @@ ON CONFLICT(device_id) DO UPDATE SET
 	return err
 }
 
+// TouchDevice 更新设备的最后在线时间为当前时刻。
+// 通常在收到设备心跳（ping）时调用。
 func (s *Store) TouchDevice(deviceID string) error {
 	_, err := s.db.Exec(`UPDATE devices SET last_online = CURRENT_TIMESTAMP WHERE device_id = ?`, deviceID)
 	return err
 }
 
+// IsBlacklisted 检查设备是否在黑名单中。
+// 如果设备不存在，返回 false（不视为黑名单设备）。
 func (s *Store) IsBlacklisted(deviceID string) (bool, error) {
 	var value bool
 	err := s.db.QueryRow(`SELECT is_blacklisted FROM devices WHERE device_id = ?`, deviceID).Scan(&value)
@@ -176,11 +221,16 @@ func (s *Store) IsBlacklisted(deviceID string) (bool, error) {
 	return value, err
 }
 
+// SetBlacklisted 设置设备的黑名单状态。
+// value=true 表示拉黑，value=false 表示解除拉黑。
 func (s *Store) SetBlacklisted(deviceID string, value bool) error {
 	_, err := s.db.Exec(`UPDATE devices SET is_blacklisted = ? WHERE device_id = ?`, value, deviceID)
 	return err
 }
 
+// UpdateLAN 更新家庭服务器的局域网网段信息。
+// 返回 (changed, error)：changed=true 表示网段发生了变化（与之前不同）。
+// 网段变化时需要通知相关客户端。
 func (s *Store) UpdateLAN(deviceID, cidr string) (bool, error) {
 	var previous string
 	if err := s.db.QueryRow(`SELECT COALESCE(lan_cidr, '') FROM devices WHERE device_id = ?`, deviceID).Scan(&previous); err != nil {
@@ -190,6 +240,12 @@ func (s *Store) UpdateLAN(deviceID, cidr string) (bool, error) {
 	return previous != cidr, err
 }
 
+// ============================================================
+// 家庭管理
+// ============================================================
+
+// CreateFamily 创建一个新的家庭，返回自增的家庭 ID。
+// visibility 默认为 "private"，必须是 "public" 或 "private"。
 func (s *Store) CreateFamily(name, visibility string) (int64, error) {
 	if visibility == "" {
 		visibility = protocol.FamilyVisibilityPrivate
@@ -204,6 +260,7 @@ func (s *Store) CreateFamily(name, visibility string) (int64, error) {
 	return res.LastInsertId()
 }
 
+// SetFamilyVisibility 设置家庭的可见性。
 func (s *Store) SetFamilyVisibility(familyID int64, visibility string) error {
 	if visibility != protocol.FamilyVisibilityPublic && visibility != protocol.FamilyVisibilityPrivate {
 		return fmt.Errorf("invalid visibility: %s", visibility)
@@ -212,6 +269,8 @@ func (s *Store) SetFamilyVisibility(familyID int64, visibility string) error {
 	return err
 }
 
+// BindHomeServer 将家庭服务器绑定到指定家庭。
+// 使用事务确保：1) 目标设备确实是 home-server 类型；2) 家庭的 home_server_id 更新；3) 设备的 family_id 更新。
 func (s *Store) BindHomeServer(familyID int64, homeServerID string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -235,6 +294,8 @@ func (s *Store) BindHomeServer(familyID int64, homeServerID string) error {
 	return tx.Commit()
 }
 
+// GrantFamilyDevice 授权客户端访问指定家庭（用于私密家庭）。
+// 使用 ON CONFLICT DO NOTHING 保证幂等性（重复授权不报错）。
 func (s *Store) GrantFamilyDevice(familyID int64, deviceID string) error {
 	_, err := s.db.Exec(`
 INSERT INTO family_device_grants(family_id, device_id) VALUES(?, ?)
@@ -243,11 +304,14 @@ ON CONFLICT(family_id, device_id) DO NOTHING
 	return err
 }
 
+// RevokeFamilyDevice 撤销客户端对指定家庭的访问权限。
 func (s *Store) RevokeFamilyDevice(familyID int64, deviceID string) error {
 	_, err := s.db.Exec(`DELETE FROM family_device_grants WHERE family_id = ? AND device_id = ?`, familyID, deviceID)
 	return err
 }
 
+// UnbindHomeServer 解绑家庭的家庭服务器。
+// 使用事务确保：1) 将家庭服务器的 family_id 置空；2) 将家庭的 home_server_id 置空。
 func (s *Store) UnbindHomeServer(familyID int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -270,6 +334,13 @@ func (s *Store) UnbindHomeServer(familyID int64) error {
 	return tx.Commit()
 }
 
+// ============================================================
+// 家庭查询
+// ============================================================
+
+// ListFamiliesForDevice 获取指定设备可访问的家庭列表。
+// 返回所有公开家庭 + 该设备被授权访问的私密家庭。
+// 设备通常是客户端，用于 client.family.list 请求。
 func (s *Store) ListFamiliesForDevice(deviceID string) ([]protocol.Family, error) {
 	rows, err := s.db.Query(`
 SELECT f.id, f.name, f.visibility, f.created_at, COALESCE(f.home_server_id, ''),
@@ -290,6 +361,8 @@ ORDER BY f.created_at DESC
 	return scanFamilies(rows, nil)
 }
 
+// CanDeviceAccessFamily 检查指定设备是否有权访问指定家庭。
+// 公开家庭对所有已认证设备开放，私密家庭仅对被授权设备开放。
 func (s *Store) CanDeviceAccessFamily(deviceID string, familyID int64) (bool, error) {
 	var allowed bool
 	err := s.db.QueryRow(`
@@ -310,6 +383,8 @@ SELECT EXISTS (
 	return allowed, err
 }
 
+// ListFamilies 获取所有家庭列表（管理端使用）。
+// 返回所有家庭，不论可见性。
 func (s *Store) ListFamilies() ([]protocol.Family, error) {
 	rows, err := s.db.Query(`
 SELECT f.id, f.name, f.visibility, f.created_at, COALESCE(f.home_server_id, ''),
@@ -325,6 +400,8 @@ ORDER BY f.created_at DESC
 	return scanFamilies(rows, nil)
 }
 
+// scanFamilies 从 SQL 查询结果扫描家庭列表。
+// online 参数不为 nil 时，填充家庭服务器的在线状态。
 func scanFamilies(rows *sql.Rows, online map[string]bool) ([]protocol.Family, error) {
 	var families []protocol.Family
 	for rows.Next() {
@@ -346,6 +423,8 @@ func scanFamilies(rows *sql.Rows, online map[string]bool) ([]protocol.Family, er
 	return families, rows.Err()
 }
 
+// GetFamilyHomeServer 获取指定家庭绑定的家庭服务器设备信息。
+// 用于 P2P 打洞时查找目标家庭服务器。
 func (s *Store) GetFamilyHomeServer(familyID int64) (protocol.Device, error) {
 	var d protocol.Device
 	var familyIDValue sql.NullInt64
@@ -367,6 +446,12 @@ WHERE f.id = ?
 	return d, err
 }
 
+// ============================================================
+// 设备查询
+// ============================================================
+
+// ListDevices 获取所有设备列表（管理端使用）。
+// 按最后在线时间倒序排列。
 func (s *Store) ListDevices() ([]protocol.Device, error) {
 	rows, err := s.db.Query(`
 SELECT device_id, device_type, family_id, token, is_blacklisted, last_online,
@@ -399,15 +484,26 @@ ORDER BY last_online DESC
 	return devices, rows.Err()
 }
 
+// ============================================================
+// 日志与统计
+// ============================================================
+
+// LogTraffic 记录一条流量日志。
+// direction 为 "in" 或 "out"，bytes 为本周期流量字节数。
 func (s *Store) LogTraffic(deviceID, direction string, bytes int64) error {
 	_, err := s.db.Exec(`INSERT INTO traffic_logs(device_id, direction, bytes) VALUES(?, ?, ?)`, deviceID, direction, bytes)
 	return err
 }
 
+// AddLog 添加一条服务器日志。
+// level 为日志级别（info/warn/error），source 为来源模块，message 为日志内容。
+// 注意：此方法忽略写入错误，因为日志写入失败不应中断业务流程。
 func (s *Store) AddLog(level, source, message string) {
 	_, _ = s.db.Exec(`INSERT INTO server_logs(level, source, message) VALUES(?, ?, ?)`, level, source, message)
 }
 
+// ListLogs 获取服务器日志列表，按 ID 倒序（最新在前）。
+// limit 为返回条数上限，默认 100，最大 500。
 func (s *Store) ListLogs(limit int) ([]protocol.LogEntry, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -434,6 +530,8 @@ LIMIT ?
 	return logs, rows.Err()
 }
 
+// Dashboard 获取仪表盘统计数据。
+// onlineDevices 为当前在线设备数（由 Hub 层提供），started 为服务器启动时间。
 func (s *Store) Dashboard(onlineDevices int, started time.Time) (protocol.Dashboard, error) {
 	var total sql.NullInt64
 	if err := s.db.QueryRow(`SELECT SUM(bytes) FROM traffic_logs`).Scan(&total); err != nil {

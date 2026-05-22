@@ -2,13 +2,16 @@
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+    branches: [main]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  server:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,9 +26,64 @@ jobs:
         working-directory: shared/go
       - run: go test ./...
         working-directory: server
-      - run: npm install
+      - run: npm ci
         working-directory: web-console
       - run: npm run build
         working-directory: web-console
-      - run: go build ./cmd/server
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o go-home-server ./cmd/server
         working-directory: server
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-home-server-linux-amd64
+          path: server/go-home-server
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/go-home-server
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: go-home-server-linux-amd64
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: go-home-server
+          generate_release_notes: true
