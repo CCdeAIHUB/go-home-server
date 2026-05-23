@@ -90,7 +90,17 @@ CREATE TABLE IF NOT EXISTS devices (
   lan_updated_at DATETIME,
   udp_port INTEGER NOT NULL DEFAULT 0,
   ws_endpoint TEXT,
+  note TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(family_id) REFERENCES families(id)
+);
+
+CREATE TABLE IF NOT EXISTS family_blacklists (
+  family_id INTEGER NOT NULL,
+  device_id TEXT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (family_id, device_id),
+  FOREIGN KEY(family_id) REFERENCES families(id) ON DELETE CASCADE,
+  FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS family_device_grants (
@@ -455,7 +465,7 @@ WHERE f.id = ?
 func (s *Store) ListDevices() ([]protocol.Device, error) {
 	rows, err := s.db.Query(`
 SELECT device_id, device_type, family_id, token, is_blacklisted, last_online,
-       COALESCE(lan_cidr, ''), udp_port
+       COALESCE(lan_cidr, ''), udp_port, COALESCE(note, ''), COALESCE(ws_endpoint, '')
 FROM devices
 ORDER BY last_online DESC
 `)
@@ -469,7 +479,7 @@ ORDER BY last_online DESC
 		var d protocol.Device
 		var familyID sql.NullInt64
 		var lastOnline sql.NullTime
-		if err := rows.Scan(&d.DeviceID, &d.DeviceType, &familyID, &d.Token, &d.IsBlacklisted, &lastOnline, &d.LANCIDR, &d.UDPPort); err != nil {
+		if err := rows.Scan(&d.DeviceID, &d.DeviceType, &familyID, &d.Token, &d.IsBlacklisted, &lastOnline, &d.LANCIDR, &d.UDPPort, &d.Note, &d.WSEndpoint); err != nil {
 			return nil, err
 		}
 		if familyID.Valid {
@@ -542,4 +552,278 @@ func (s *Store) Dashboard(onlineDevices int, started time.Time) (protocol.Dashbo
 		TotalBytes:    total.Int64,
 		UptimeSeconds: int64(time.Since(started).Seconds()),
 	}, nil
+}
+
+// ============================================================
+// 家庭详情与统计
+// ============================================================
+
+// FamilyDetail 获取家庭详情，包括授权设备列表、流量统计和黑名单。
+func (s *Store) FamilyDetail(familyID int64) (protocol.FamilyDetail, error) {
+	var detail protocol.FamilyDetail
+
+	// 获取家庭基本信息
+	families, err := s.ListFamilies()
+	if err != nil {
+		return detail, err
+	}
+	for _, f := range families {
+		if f.ID == familyID {
+			detail.Family = f
+			break
+		}
+	}
+	if detail.Family.ID == 0 {
+		return detail, fmt.Errorf("family not found")
+	}
+
+	// 获取授权设备列表
+	detail.Devices, err = s.listFamilyDevices(familyID)
+	if err != nil {
+		return detail, err
+	}
+
+	// 获取流量统计
+	detail.Traffic, err = s.familyTraffic(familyID)
+	if err != nil {
+		return detail, err
+	}
+
+	// 获取黑名单
+	detail.BlacklistedDevices, err = s.listFamilyBlacklist(familyID)
+	if err != nil {
+		return detail, err
+	}
+
+	return detail, nil
+}
+
+// listFamilyDevices 获取指定家庭关联的设备列表。
+func (s *Store) listFamilyDevices(familyID int64) ([]protocol.Device, error) {
+	rows, err := s.db.Query(`
+SELECT d.device_id, d.device_type, d.family_id, d.token, d.is_blacklisted,
+       d.last_online, COALESCE(d.lan_cidr, ''), d.udp_port, COALESCE(d.note, '')
+FROM devices d
+WHERE d.device_id = (SELECT f.home_server_id FROM families f WHERE f.id = ?)
+   OR d.device_id IN (
+     SELECT g.device_id FROM family_device_grants g WHERE g.family_id = ?
+   )
+ORDER BY d.last_online DESC
+`, familyID, familyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var devices []protocol.Device
+	for rows.Next() {
+		var d protocol.Device
+		var familyIDVal sql.NullInt64
+		var lastOnline sql.NullTime
+		var note string
+		if err := rows.Scan(&d.DeviceID, &d.DeviceType, &familyIDVal, &d.Token, &d.IsBlacklisted, &lastOnline, &d.LANCIDR, &d.UDPPort, &note); err != nil {
+			return nil, err
+		}
+		if familyIDVal.Valid {
+			v := familyIDVal.Int64
+			d.FamilyID = &v
+		}
+		if lastOnline.Valid {
+			d.LastOnline = &lastOnline.Time
+		}
+		_ = note
+		devices = append(devices, d)
+	}
+	return devices, rows.Err()
+}
+
+// familyTraffic 获取指定家庭的流量统计。
+func (s *Store) familyTraffic(familyID int64) (protocol.TrafficStats, error) {
+	var stats protocol.TrafficStats
+	// Get traffic from home server device
+	err := s.db.QueryRow(`
+SELECT
+  COALESCE(SUM(CASE WHEN tl.direction IN ('up', 'out') THEN tl.bytes ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN tl.direction IN ('down', 'in') THEN tl.bytes ELSE 0 END), 0)
+FROM traffic_logs tl
+WHERE tl.device_id = (SELECT f.home_server_id FROM families f WHERE f.id = ?)
+`, familyID).Scan(&stats.UpBytes, &stats.DownBytes)
+	if err != nil {
+		return stats, err
+	}
+	return stats, nil
+}
+
+// FamilyTraffic 获取指定家庭的流量统计（公开方法）。
+func (s *Store) FamilyTraffic(familyID int64) (protocol.TrafficStats, error) {
+	return s.familyTraffic(familyID)
+}
+
+// listFamilyBlacklist 获取指定家庭的黑名单设备 ID 列表。
+func (s *Store) listFamilyBlacklist(familyID int64) ([]string, error) {
+	rows, err := s.db.Query(`SELECT device_id FROM family_blacklists WHERE family_id = ?`, familyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// AddFamilyBlacklist 将设备加入家庭黑名单。
+func (s *Store) AddFamilyBlacklist(familyID int64, deviceID string) error {
+	_, err := s.db.Exec(`
+INSERT INTO family_blacklists(family_id, device_id) VALUES(?, ?)
+ON CONFLICT(family_id, device_id) DO NOTHING
+`, familyID, deviceID)
+	if err != nil {
+		return err
+	}
+	// Also revoke the grant if exists
+	return s.RevokeFamilyDevice(familyID, deviceID)
+}
+
+// RemoveFamilyBlacklist 将设备从家庭黑名单中移除。
+func (s *Store) RemoveFamilyBlacklist(familyID int64, deviceID string) error {
+	_, err := s.db.Exec(`DELETE FROM family_blacklists WHERE family_id = ? AND device_id = ?`, familyID, deviceID)
+	return err
+}
+
+// IsFamilyBlacklisted 检查设备是否在指定家庭的黑名单中。
+func (s *Store) IsFamilyBlacklisted(familyID int64, deviceID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM family_blacklists WHERE family_id = ? AND device_id = ?`, familyID, deviceID).Scan(&count)
+	return count > 0, err
+}
+
+// ============================================================
+// 设备详情与统计
+// ============================================================
+
+// DeviceDetail 获取设备详情，包括所属家庭、流量统计和备注。
+func (s *Store) DeviceDetail(deviceID string) (protocol.DeviceDetail, error) {
+	var detail protocol.DeviceDetail
+
+	// 获取设备基本信息
+	d, err := s.getDevice(deviceID)
+	if err != nil {
+		return detail, err
+	}
+	detail.Device = d
+
+	// 获取设备所属/被授权的家庭
+	detail.Families, err = s.listDeviceFamilies(deviceID)
+	if err != nil {
+		return detail, err
+	}
+
+	// 获取流量统计
+	detail.Traffic, err = s.DeviceTraffic(deviceID)
+	if err != nil {
+		return detail, err
+	}
+
+	// 获取备注
+	detail.Note = d.Note
+
+	return detail, nil
+}
+
+// getDevice 获取单个设备信息。
+func (s *Store) getDevice(deviceID string) (protocol.Device, error) {
+	var d protocol.Device
+	var familyID sql.NullInt64
+	var lastOnline sql.NullTime
+	var note string
+	err := s.db.QueryRow(`
+SELECT device_id, device_type, family_id, token, is_blacklisted, last_online,
+       COALESCE(lan_cidr, ''), udp_port, COALESCE(note, '')
+FROM devices
+WHERE device_id = ?
+`, deviceID).Scan(&d.DeviceID, &d.DeviceType, &familyID, &d.Token, &d.IsBlacklisted, &lastOnline, &d.LANCIDR, &d.UDPPort, &note)
+	if err != nil {
+		return d, err
+	}
+	if familyID.Valid {
+		v := familyID.Int64
+		d.FamilyID = &v
+	}
+	if lastOnline.Valid {
+		d.LastOnline = &lastOnline.Time
+	}
+	d.Note = note
+	return d, nil
+}
+
+// listDeviceFamilies 获取设备关联的家庭列表。
+func (s *Store) listDeviceFamilies(deviceID string) ([]protocol.Family, error) {
+	rows, err := s.db.Query(`
+SELECT f.id, f.name, f.visibility, f.created_at, COALESCE(f.home_server_id, ''),
+       COALESCE(d.lan_cidr, ''), d.lan_updated_at
+FROM families f
+LEFT JOIN devices d ON d.device_id = f.home_server_id
+WHERE f.home_server_id = ?
+   OR EXISTS (
+     SELECT 1 FROM family_device_grants g
+     WHERE g.family_id = f.id AND g.device_id = ?
+   )
+ORDER BY f.created_at DESC
+`, deviceID, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFamilies(rows, nil)
+}
+
+// DeviceTraffic 获取指定设备的流量统计。
+func (s *Store) DeviceTraffic(deviceID string) (protocol.TrafficStats, error) {
+	var stats protocol.TrafficStats
+	err := s.db.QueryRow(`
+SELECT
+  COALESCE(SUM(CASE WHEN direction IN ('up', 'out') THEN bytes ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN direction IN ('down', 'in') THEN bytes ELSE 0 END), 0)
+FROM traffic_logs
+WHERE device_id = ?
+`, deviceID).Scan(&stats.UpBytes, &stats.DownBytes)
+	return stats, err
+}
+
+// SetDeviceNote 设置设备备注。
+func (s *Store) SetDeviceNote(deviceID, note string) error {
+	_, err := s.db.Exec(`UPDATE devices SET note = ? WHERE device_id = ?`, note, deviceID)
+	return err
+}
+
+// ListFamiliesForDeviceWithBlacklist 获取设备可访问的家庭列表（排除黑名单）。
+func (s *Store) ListFamiliesForDeviceWithBlacklist(deviceID string) ([]protocol.Family, error) {
+	rows, err := s.db.Query(`
+SELECT f.id, f.name, f.visibility, f.created_at, COALESCE(f.home_server_id, ''),
+       COALESCE(d.lan_cidr, ''), d.lan_updated_at
+FROM families f
+LEFT JOIN devices d ON d.device_id = f.home_server_id
+WHERE (f.visibility = 'public'
+   OR EXISTS (
+     SELECT 1 FROM family_device_grants g
+     WHERE g.family_id = f.id AND g.device_id = ?
+   ))
+  AND NOT EXISTS (
+     SELECT 1 FROM family_blacklists b
+     WHERE b.family_id = f.id AND b.device_id = ?
+   )
+ORDER BY f.created_at DESC
+`, deviceID, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFamilies(rows, nil)
 }

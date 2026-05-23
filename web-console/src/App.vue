@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import {
+  ArrowLeft,
   Ban,
   Cable,
   Check,
@@ -11,12 +12,16 @@ import {
   Lock,
   LogIn,
   LogOut,
+  Monitor,
   Plus,
   Search,
   Router,
   Settings,
   Shield,
-  Users
+  Smartphone,
+  Trash2,
+  Users,
+  X
 } from '@lucide/vue'
 
 const tabs = [
@@ -50,7 +55,19 @@ const state = reactive({
   oldPassword: '',
   newPassword: '',
   confirmPassword: '',
-  toasts: []
+  toasts: [],
+  // Detail views
+  familyDetail: null,
+  deviceDetail: null,
+  familyDetailData: null,
+  deviceDetailData: null,
+  deviceSearch: '',
+  // Device note editing
+  editingNote: false,
+  noteValue: '',
+  // Grant family to device
+  grantingFamily: false,
+  selectedFamilyId: ''
 })
 
 const loading = ref(false)
@@ -82,6 +99,20 @@ const filteredFamilies = computed(() => {
     return matchesKeyword && matchesVisibility && matchesOnline
   })
 })
+
+const filteredDevices = computed(() => {
+  const keyword = state.deviceSearch.trim().toLowerCase()
+  return state.devices.filter((device) => {
+    return !keyword ||
+      device.device_id.toLowerCase().includes(keyword) ||
+      device.device_type.toLowerCase().includes(keyword) ||
+      (device.note || '').toLowerCase().includes(keyword)
+  })
+})
+
+const privateFamilies = computed(() =>
+  state.families.filter(f => f.visibility === 'private')
+)
 
 function wsURL() {
   if (import.meta.env.VITE_GO_HOME_WS) return import.meta.env.VITE_GO_HOME_WS
@@ -209,6 +240,16 @@ async function grantFamily(family, deviceID) {
   await command('客户端授权已保存', async () => {
     await rpc('front.family.grant_device', { family_id: family.id, device_id: deviceID })
     await refreshAll()
+    if (state.familyDetailData) await loadFamilyDetail(state.familyDetail)
+  })
+}
+
+async function revokeFamily(familyID, deviceID) {
+  if (!confirm('确认撤销该客户端的访问权限？')) return
+  await command('授权已撤销', async () => {
+    await rpc('front.family.revoke_device', { family_id: familyID, device_id: deviceID })
+    await refreshAll()
+    if (state.familyDetailData) await loadFamilyDetail(state.familyDetail)
   })
 }
 
@@ -260,6 +301,94 @@ async function updatePassword() {
   })
 }
 
+// ── Family Detail ──
+
+async function openFamilyDetail(family) {
+  state.familyDetail = family
+  state.familyDetailData = null
+  await loadFamilyDetail(family)
+}
+
+async function loadFamilyDetail(family) {
+  try {
+    state.familyDetailData = await rpc('front.family.detail', { family_id: family.id })
+  } catch (e) {
+    notify(e.message, 'error')
+  }
+}
+
+function closeFamilyDetail() {
+  state.familyDetail = null
+  state.familyDetailData = null
+}
+
+async function familyBlacklist(familyID, deviceID) {
+  if (!confirm('将该设备永久禁止加入此家庭，是否继续？')) return
+  await command('设备已加入家庭黑名单', async () => {
+    await rpc('front.family.blacklist', { family_id: familyID, device_id: deviceID })
+    await refreshAll()
+    await loadFamilyDetail(state.familyDetail)
+  })
+}
+
+async function familyUnblacklist(familyID, deviceID) {
+  await command('设备已移出家庭黑名单', async () => {
+    await rpc('front.family.unblacklist', { family_id: familyID, device_id: deviceID })
+    await refreshAll()
+    await loadFamilyDetail(state.familyDetail)
+  })
+}
+
+// ── Device Detail ──
+
+async function openDeviceDetail(device) {
+  state.deviceDetail = device
+  state.deviceDetailData = null
+  await loadDeviceDetail(device)
+}
+
+async function loadDeviceDetail(device) {
+  try {
+    state.deviceDetailData = await rpc('front.device.detail', { device_id: device.device_id })
+  } catch (e) {
+    notify(e.message, 'error')
+  }
+}
+
+function closeDeviceDetail() {
+  state.deviceDetail = null
+  state.deviceDetailData = null
+  state.editingNote = false
+  state.grantingFamily = false
+}
+
+async function saveDeviceNote() {
+  await command('备注已保存', async () => {
+    await rpc('front.device.set_note', { device_id: state.deviceDetail.device_id, note: state.noteValue })
+    state.editingNote = false
+    await refreshAll()
+    await loadDeviceDetail(state.deviceDetail)
+  })
+}
+
+function startEditNote() {
+  state.noteValue = state.deviceDetailData?.note || ''
+  state.editingNote = true
+}
+
+async function grantDeviceToFamily() {
+  if (!state.selectedFamilyId) return
+  await command('客户端已授权加入家庭', async () => {
+    await rpc('front.device.grant_family', { family_id: Number(state.selectedFamilyId), device_id: state.deviceDetail.device_id })
+    state.grantingFamily = false
+    state.selectedFamilyId = ''
+    await refreshAll()
+    await loadDeviceDetail(state.deviceDetail)
+  })
+}
+
+// ── Helpers ──
+
 async function command(message, task) {
   state.error = ''
   try {
@@ -303,6 +432,15 @@ function formatDuration(seconds) {
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
   return `${h}小时 ${m}分钟`
+}
+
+function timeAgo(ts) {
+  if (!ts) return '从未'
+  const sec = Math.floor((Date.now() - new Date(ts).getTime()) / 1000)
+  if (sec < 60) return `${sec}秒前`
+  if (sec < 3600) return `${Math.floor(sec / 60)}分钟前`
+  if (sec < 86400) return `${Math.floor(sec / 3600)}小时前`
+  return `${Math.floor(sec / 86400)}天前`
 }
 
 onBeforeUnmount(() => {
@@ -370,6 +508,7 @@ onBeforeUnmount(() => {
           </span>
         </header>
 
+        <!-- Dashboard -->
         <section v-if="state.tab === 'dashboard'" class="metric-grid">
           <article class="metric">
             <Users :size="22" />
@@ -388,6 +527,7 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
+        <!-- Families -->
         <section v-if="state.tab === 'families'" class="stack">
           <form class="toolbar" @submit.prevent="createFamily">
             <input v-model="state.newFamilyName" placeholder="家庭名称" />
@@ -418,14 +558,14 @@ onBeforeUnmount(() => {
             </select>
           </div>
 
-          <article v-for="family in filteredFamilies" :key="family.id" class="list-row">
+          <article v-for="family in filteredFamilies" :key="family.id" class="list-row clickable" @click="openFamilyDetail(family)">
             <div class="row-main">
               <strong>{{ family.name }}</strong>
-              <span>{{ family.visibility === 'public' ? '公开家庭' : '私密家庭' }}</span>
-              <span>{{ family.home_server_online ? '家庭服务器在线' : '家庭服务器离线' }}</span>
+              <span class="tag" :class="family.visibility === 'public' ? 'tag-public' : 'tag-private'">{{ family.visibility === 'public' ? '公开' : '私密' }}</span>
+              <span>{{ family.home_server_online ? '在线' : '离线' }}</span>
               <span>LAN {{ family.lan_cidr || '未上报' }}</span>
             </div>
-            <div class="row-actions">
+            <div class="row-actions" @click.stop>
               <button class="icon-button" title="设为公开" @click="setVisibility(family, 'public')">
                 <Check :size="17" />
               </button>
@@ -433,14 +573,8 @@ onBeforeUnmount(() => {
                 <Lock :size="17" />
               </button>
               <select v-if="!family.home_server_id" @change="bindHomeServer(family, $event.target.value)">
-                <option value="">绑定家庭服务器</option>
+                <option value="">绑定服务器</option>
                 <option v-for="device in onlineHomeServers" :key="device.device_id" :value="device.device_id">
-                  {{ device.device_id }}
-                </option>
-              </select>
-              <select v-if="family.visibility === 'private'" @change="grantFamily(family, $event.target.value)">
-                <option value="">授权客户端</option>
-                <option v-for="device in clientDevices" :key="device.device_id" :value="device.device_id">
                   {{ device.device_id }}
                 </option>
               </select>
@@ -452,16 +586,139 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
-        <section v-if="state.tab === 'devices'" class="stack">
-          <article v-for="device in state.devices" :key="device.device_id" class="list-row">
-            <div class="row-main">
-              <strong>{{ device.device_id }}</strong>
-              <span>{{ device.device_type }}</span>
-              <span>{{ device.online ? '在线' : '离线' }}</span>
-              <span v-if="device.latency_ms">延迟 {{ device.latency_ms }} ms</span>
-              <span v-if="device.is_blacklisted">已拉黑</span>
+        <!-- Family Detail Modal -->
+        <section v-if="state.familyDetail" class="detail-overlay" @click.self="closeFamilyDetail">
+          <article class="detail-panel">
+            <header class="detail-header">
+              <div>
+                <p class="eyebrow">家庭详情</p>
+                <h2>{{ state.familyDetail.name }}</h2>
+              </div>
+              <button class="icon-button" @click="closeFamilyDetail">
+                <X :size="20" />
+              </button>
+            </header>
+
+            <div v-if="state.familyDetailData" class="detail-body">
+              <div class="metric-grid">
+                <article class="metric">
+                  <span>可见性</span>
+                  <strong>{{ state.familyDetailData.family.visibility === 'public' ? '公开' : '私密' }}</strong>
+                </article>
+                <article class="metric">
+                  <span>家庭服务器</span>
+                  <strong>{{ state.familyDetailData.family.home_server_online ? '在线' : '离线' }}</strong>
+                </article>
+                <article class="metric">
+                  <span>局域网网段</span>
+                  <strong>{{ state.familyDetailData.family.lan_cidr || '未上报' }}</strong>
+                </article>
+              </div>
+
+              <div class="metric-grid">
+                <article class="metric">
+                  <span>上行流量</span>
+                  <strong>{{ formatBytes(state.familyDetailData.traffic.up_bytes) }}</strong>
+                </article>
+                <article class="metric">
+                  <span>下行流量</span>
+                  <strong>{{ formatBytes(state.familyDetailData.traffic.down_bytes) }}</strong>
+                </article>
+              </div>
+
+              <!-- Authorized Devices -->
+              <div class="sub-section">
+                <h3><Users :size="18" /> 已授权设备</h3>
+                <div class="toolbar compact" v-if="state.familyDetail.visibility === 'private'">
+                  <select @change="grantFamily(state.familyDetail, $event.target.value)">
+                    <option value="">添加客户端</option>
+                    <option v-for="device in clientDevices" :key="device.device_id" :value="device.device_id">
+                      {{ device.note || device.device_id }}
+                    </option>
+                  </select>
+                </div>
+                <article v-for="dev in state.familyDetailData.devices" :key="dev.device_id" class="list-row compact">
+                  <div class="row-main">
+                    <Monitor v-if="dev.device_type === 'home-server'" :size="16" />
+                    <Smartphone v-else :size="16" />
+                    <strong>{{ dev.note || dev.device_id.substring(0, 16) + '…' }}</strong>
+                    <span class="tag" :class="dev.device_type === 'home-server' ? 'tag-public' : 'tag-private'">
+                      {{ dev.device_type === 'home-server' ? '家庭服务器' : '客户端' }}
+                    </span>
+                    <span :class="dev.online ? 'text-success' : 'text-muted'">{{ dev.online ? '在线' : '离线' }}</span>
+                    <span v-if="dev.latency_ms">延迟 {{ dev.latency_ms }} ms</span>
+                  </div>
+                  <div class="row-actions">
+                    <button v-if="dev.device_type === 'client'" class="icon-button" title="撤销授权" @click="revokeFamily(state.familyDetail.id, dev.device_id)">
+                      <Trash2 :size="16" />
+                    </button>
+                    <button class="icon-button" title="查看详情" @click="closeFamilyDetail(); openDeviceDetail(dev)">
+                      <ArrowLeft :size="16" />
+                    </button>
+                  </div>
+                </article>
+                <p v-if="!state.familyDetailData.devices.length" class="empty-text">暂无已授权设备</p>
+              </div>
+
+              <!-- Blacklisted Devices -->
+              <div class="sub-section" v-if="state.familyDetailData.blacklisted_devices.length">
+                <h3><Ban :size="18" /> 家庭黑名单</h3>
+                <article v-for="deviceId in state.familyDetailData.blacklisted_devices" :key="deviceId" class="list-row compact">
+                  <div class="row-main">
+                    <Ban :size="16" class="text-danger" />
+                    <strong>{{ deviceId.substring(0, 24) }}…</strong>
+                    <span class="text-muted">永久禁止加入</span>
+                  </div>
+                  <div class="row-actions">
+                    <button @click="familyUnblacklist(state.familyDetail.id, deviceId)">
+                      <Check :size="16" />
+                      移出黑名单
+                    </button>
+                  </div>
+                </article>
+              </div>
+
+              <!-- Add to Blacklist -->
+              <div class="sub-section">
+                <h3><Ban :size="18" /> 加入黑名单</h3>
+                <div class="toolbar compact">
+                  <select @change="familyBlacklist(state.familyDetail.id, $event.target.value)">
+                    <option value="">选择设备加入黑名单</option>
+                    <option v-for="device in clientDevices" :key="device.device_id" :value="device.device_id">
+                      {{ device.note || device.device_id }}
+                    </option>
+                  </select>
+                </div>
+              </div>
             </div>
-            <div class="row-actions">
+            <div v-else class="detail-body">
+              <p>加载中...</p>
+            </div>
+          </article>
+        </section>
+
+        <!-- Devices -->
+        <section v-if="state.tab === 'devices'" class="stack">
+          <div class="filterbar">
+            <label class="search-box">
+              <Search :size="18" />
+              <input v-model="state.deviceSearch" placeholder="搜索设备 ID、类型、备注" />
+            </label>
+          </div>
+
+          <article v-for="device in filteredDevices" :key="device.device_id" class="list-row clickable" @click="openDeviceDetail(device)">
+            <div class="row-main">
+              <Monitor v-if="device.device_type === 'home-server'" :size="16" />
+              <Smartphone v-else :size="16" />
+              <strong>{{ device.note || device.device_id }}</strong>
+              <span class="tag" :class="device.device_type === 'home-server' ? 'tag-public' : 'tag-private'">
+                {{ device.device_type === 'home-server' ? '家庭服务器' : '客户端' }}
+              </span>
+              <span :class="device.online ? 'text-success' : 'text-muted'">{{ device.online ? '在线' : '离线' }}</span>
+              <span v-if="device.latency_ms">延迟 {{ device.latency_ms }} ms</span>
+              <span v-if="device.is_blacklisted" class="text-danger">已拉黑</span>
+            </div>
+            <div class="row-actions" @click.stop>
               <button @click="forceOffline(device)">
                 <LogOut :size="17" />
                 下线
@@ -478,6 +735,140 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
+        <!-- Device Detail Modal -->
+        <section v-if="state.deviceDetail" class="detail-overlay" @click.self="closeDeviceDetail">
+          <article class="detail-panel">
+            <header class="detail-header">
+              <div>
+                <p class="eyebrow">设备详情</p>
+                <h2>{{ state.deviceDetailData?.note || state.deviceDetail.device_id }}</h2>
+              </div>
+              <button class="icon-button" @click="closeDeviceDetail">
+                <X :size="20" />
+              </button>
+            </header>
+
+            <div v-if="state.deviceDetailData" class="detail-body">
+              <div class="metric-grid">
+                <article class="metric">
+                  <span>设备类型</span>
+                  <strong>{{ state.deviceDetailData.device.device_type === 'home-server' ? '家庭服务器' : '客户端' }}</strong>
+                </article>
+                <article class="metric">
+                  <span>在线状态</span>
+                  <strong :class="state.deviceDetailData.device.online ? 'text-success' : 'text-muted'">
+                    {{ state.deviceDetailData.device.online ? '在线' : '离线' }}
+                  </strong>
+                </article>
+                <article class="metric">
+                  <span>延迟</span>
+                  <strong>{{ state.deviceDetailData.device.latency_ms || 0 }} ms</strong>
+                </article>
+                <article class="metric">
+                  <span>最后在线</span>
+                  <strong>{{ timeAgo(state.deviceDetailData.device.last_online) }}</strong>
+                </article>
+              </div>
+
+              <div class="metric-grid">
+                <article class="metric">
+                  <span>上行流量</span>
+                  <strong>{{ formatBytes(state.deviceDetailData.traffic.up_bytes) }}</strong>
+                </article>
+                <article class="metric">
+                  <span>下行流量</span>
+                  <strong>{{ formatBytes(state.deviceDetailData.traffic.down_bytes) }}</strong>
+                </article>
+                <article class="metric">
+                  <span>局域网网段</span>
+                  <strong>{{ state.deviceDetailData.device.lan_cidr || '-' }}</strong>
+                </article>
+                <article class="metric">
+                  <span>UDP 端口</span>
+                  <strong>{{ state.deviceDetailData.device.udp_port || '-' }}</strong>
+                </article>
+              </div>
+
+              <!-- Device Note -->
+              <div class="sub-section">
+                <h3>备注</h3>
+                <div v-if="!state.editingNote" class="note-row">
+                  <span>{{ state.deviceDetailData.note || '暂无备注' }}</span>
+                  <button @click="startEditNote">编辑备注</button>
+                </div>
+                <div v-else class="toolbar compact">
+                  <input v-model="state.noteValue" placeholder="输入设备备注" />
+                  <button @click="saveDeviceNote">
+                    <Check :size="16" />
+                    保存
+                  </button>
+                  <button class="ghost-button" @click="state.editingNote = false">取消</button>
+                </div>
+              </div>
+
+              <!-- Authorized Families -->
+              <div class="sub-section">
+                <h3><Home :size="18" /> 已加入的家庭</h3>
+                <article v-for="family in state.deviceDetailData.families" :key="family.id" class="list-row compact">
+                  <div class="row-main">
+                    <Home :size="16" />
+                    <strong>{{ family.name }}</strong>
+                    <span class="tag" :class="family.visibility === 'public' ? 'tag-public' : 'tag-private'">
+                      {{ family.visibility === 'public' ? '公开' : '私密' }}
+                    </span>
+                  </div>
+                </article>
+                <p v-if="!state.deviceDetailData.families.length" class="empty-text">暂未加入任何家庭</p>
+
+                <!-- Grant to Private Family -->
+                <div v-if="state.deviceDetailData.device.device_type === 'client'" class="toolbar compact" style="margin-top: 10px;">
+                  <template v-if="!state.grantingFamily">
+                    <button @click="state.grantingFamily = true">
+                      <Plus :size="16" />
+                      加入私密家庭
+                    </button>
+                  </template>
+                  <template v-else>
+                    <select v-model="state.selectedFamilyId">
+                      <option value="">选择私密家庭</option>
+                      <option v-for="family in privateFamilies" :key="family.id" :value="family.id">
+                        {{ family.name }} (ID: {{ family.id }})
+                      </option>
+                    </select>
+                    <button @click="grantDeviceToFamily" :disabled="!state.selectedFamilyId">
+                      <Check :size="16" />
+                      确认
+                    </button>
+                    <button class="ghost-button" @click="state.grantingFamily = false">取消</button>
+                  </template>
+                </div>
+              </div>
+
+              <!-- Blacklist Status -->
+              <div class="sub-section">
+                <h3>黑名单状态</h3>
+                <div class="note-row">
+                  <span :class="state.deviceDetailData.device.is_blacklisted ? 'text-danger' : 'text-success'">
+                    {{ state.deviceDetailData.device.is_blacklisted ? '已拉黑 - 设备无法连接服务器' : '正常 - 设备可正常连接' }}
+                  </span>
+                  <button v-if="!state.deviceDetailData.device.is_blacklisted" class="danger" @click="setBlacklist(state.deviceDetailData.device, true); closeDeviceDetail()">
+                    <Ban :size="16" />
+                    拉黑
+                  </button>
+                  <button v-else @click="setBlacklist(state.deviceDetailData.device, false); closeDeviceDetail()">
+                    <Check :size="16" />
+                    解除拉黑
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div v-else class="detail-body">
+              <p>加载中...</p>
+            </div>
+          </article>
+        </section>
+
+        <!-- Logs -->
         <section v-if="state.tab === 'logs'" class="stack">
           <article v-for="entry in state.logs" :key="entry.id" class="log-row">
             <span :class="['log-level', entry.level]">{{ entry.level }}</span>
@@ -487,6 +878,7 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
+        <!-- Settings -->
         <section v-if="state.tab === 'settings'" class="settings-grid">
           <form class="settings-panel" @submit.prevent="updatePassword">
             <h3>管理员密码</h3>

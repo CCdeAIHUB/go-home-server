@@ -252,6 +252,101 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 			}
 			return h.store.ListLogs(params.Limit)
 		})
+	case protocol.ActionFrontFamilyDetail:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.FamilyDetailParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			detail, err := h.store.FamilyDetail(params.FamilyID)
+			if err != nil {
+				return nil, err
+			}
+			h.markOnline(detail.Devices)
+			h.markFamilyOnline([]protocol.Family{detail.Family})
+			return detail, nil
+		})
+	case protocol.ActionFrontFamilyTraffic:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.FamilyDetailParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			return h.store.FamilyTraffic(params.FamilyID)
+		})
+	case protocol.ActionFrontFamilyBlacklist:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.FamilyBlacklistParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			if err := h.store.AddFamilyBlacklist(params.FamilyID, params.DeviceID); err != nil {
+				return nil, err
+			}
+			h.store.AddLog("warn", "family", "设备加入家庭黑名单: "+params.DeviceID)
+			h.dataChanged("family.blacklist")
+			return ok(), nil
+		})
+	case protocol.ActionFrontFamilyUnblacklist:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.FamilyBlacklistParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			if err := h.store.RemoveFamilyBlacklist(params.FamilyID, params.DeviceID); err != nil {
+				return nil, err
+			}
+			h.store.AddLog("info", "family", "设备移出家庭黑名单: "+params.DeviceID)
+			h.dataChanged("family.unblacklist")
+			return ok(), nil
+		})
+	case protocol.ActionFrontDeviceDetail:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.DeviceDetailParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			detail, err := h.store.DeviceDetail(params.DeviceID)
+			if err != nil {
+				return nil, err
+			}
+			h.markOnline([]protocol.Device{detail.Device})
+			h.markFamilyOnline(detail.Families)
+			return detail, nil
+		})
+	case protocol.ActionFrontDeviceTraffic:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.DeviceDetailParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			return h.store.DeviceTraffic(params.DeviceID)
+		})
+	case protocol.ActionFrontDeviceSetNote:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.DeviceNoteParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			if err := h.store.SetDeviceNote(params.DeviceID, params.Note); err != nil {
+				return nil, err
+			}
+			h.dataChanged("device.note")
+			return ok(), nil
+		})
+	case protocol.ActionFrontDeviceGrantFamily:
+		return h.requireAdmin(s, env, func() (any, error) {
+			params, err := protocol.DecodeParams[protocol.FamilyGrantParams](env.Params)
+			if err != nil {
+				return nil, err
+			}
+			if err := h.store.GrantFamilyDevice(params.FamilyID, params.DeviceID); err != nil {
+				return nil, err
+			}
+			h.store.AddLog("info", "device", "客户端授权加入家庭: "+params.DeviceID)
+			h.dataChanged("device.grant_family")
+			return ok(), nil
+		})
 	case protocol.ActionFrontConfigGet:
 		return h.requireAdmin(s, env, func() (any, error) {
 			authCode, err := h.store.GetConfig(store.ConfigAuthCode)
@@ -506,12 +601,12 @@ func (h *Hub) deviceLANReport(s *Session, env protocol.Envelope) protocol.Envelo
 }
 
 // clientFamilyList 处理客户端获取可访问家庭列表的请求。
-// 返回公开家庭 + 该客户端被授权访问的私密家庭。
+// 返回公开家庭 + 该客户端被授权访问的私密家庭，排除家庭黑名单中的家庭。
 func (h *Hub) clientFamilyList(s *Session, env protocol.Envelope) protocol.Envelope {
 	if s.deviceID == "" || s.kind != protocol.DeviceTypeClient {
 		return protocol.Error(env.ID, "unauthorized", "client auth required")
 	}
-	families, err := h.store.ListFamiliesForDevice(s.deviceID)
+	families, err := h.store.ListFamiliesForDeviceWithBlacklist(s.deviceID)
 	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
 	}
