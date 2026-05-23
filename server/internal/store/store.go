@@ -16,6 +16,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"gohome/shared/protocol"
@@ -61,6 +63,7 @@ func (s *Store) Close() error {
 
 // migrate 执行数据库表结构迁移。
 // 使用 CREATE TABLE IF NOT EXISTS 保证幂等性，多次调用不会报错。
+// 对于已有表的新增列，使用 ALTER TABLE ADD COLUMN 迁移。
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 PRAGMA foreign_keys = ON;
@@ -128,7 +131,27 @@ CREATE TABLE IF NOT EXISTS server_logs (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `)
-	return err
+	if err != nil {
+		return fmt.Errorf("create tables: %w", err)
+	}
+
+	// 增量迁移：为已有的表添加新列（CREATE TABLE IF NOT EXISTS 不会修改已有表结构）
+	s.migrateAddColumn("devices", "note", "TEXT NOT NULL DEFAULT ''")
+	s.migrateAddColumn("devices", "ws_endpoint", "TEXT")
+
+	return nil
+}
+
+// migrateAddColumn 尝试为已有表添加新列，忽略"列已存在"的错误。
+func (s *Store) migrateAddColumn(table, column, definition string) {
+	_, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate column name") {
+			// 列已存在，无需操作
+			return
+		}
+		log.Printf("migration warning: ALTER TABLE %s ADD COLUMN %s: %v", table, column, err)
+	}
 }
 
 // InitDefaults 在首次启动时初始化默认配置值。
@@ -413,7 +436,7 @@ ORDER BY f.created_at DESC
 // scanFamilies 从 SQL 查询结果扫描家庭列表。
 // online 参数不为 nil 时，填充家庭服务器的在线状态。
 func scanFamilies(rows *sql.Rows, online map[string]bool) ([]protocol.Family, error) {
-	var families []protocol.Family
+	families := make([]protocol.Family, 0)
 	for rows.Next() {
 		var f protocol.Family
 		var homeServerID string

@@ -610,6 +610,10 @@ func (h *Hub) clientFamilyList(s *Session, env protocol.Envelope) protocol.Envel
 	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
 	}
+	// 确保 nil slice 被序列化为 [] 而非 null（安卓客户端需解析数组）
+	if families == nil {
+		families = []protocol.Family{}
+	}
 	h.markFamilyOnline(families)
 	return protocol.Result(env.ID, families)
 }
