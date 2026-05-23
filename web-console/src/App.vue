@@ -132,10 +132,30 @@ function connect() {
     ws.onerror = () => reject(new Error('无法连接服务器'))
     ws.onclose = () => {
       state.connected = false
-      state.loggedIn = false
+      // WebSocket 断开时不立即清除 loggedIn，等重连后再判断
     }
     ws.onmessage = (event) => handleMessage(JSON.parse(event.data))
   })
+}
+
+// 尝试用 localStorage 中保存的 token 恢复登录状态
+async function tryRestoreSession() {
+  const savedToken = localStorage.getItem('go-home-token')
+  if (!savedToken) return false
+  state.token = savedToken
+  try {
+    await connect()
+    // 发送一个需要鉴权的请求来验证 token 是否仍然有效
+    await rpc('front.dashboard')
+    state.loggedIn = true
+    await refreshAll()
+    return true
+  } catch {
+    // token 失效（服务器重启等），清除并要求重新登录
+    state.token = ''
+    localStorage.removeItem('go-home-token')
+    return false
+  }
 }
 
 function handleMessage(message) {
@@ -143,6 +163,7 @@ function handleMessage(message) {
     notify('账号在别处登录', 'error')
     state.loggedIn = false
     state.token = ''
+    localStorage.removeItem('go-home-token')
     return
   }
   if (message.action === 'front.data_changed') {
@@ -154,7 +175,14 @@ function handleMessage(message) {
   if (!task) return
   state.pending.delete(message.id)
   if (message.error) {
-    task.reject(new Error(message.error.message || message.error.code))
+    const err = new Error(message.error.message || message.error.code)
+    // 如果收到鉴权失败，清除登录状态
+    if (message.error.code === 'unauthorized') {
+      state.loggedIn = false
+      state.token = ''
+      localStorage.removeItem('go-home-token')
+    }
+    task.reject(err)
   } else {
     task.resolve(message.result)
   }
@@ -163,7 +191,10 @@ function handleMessage(message) {
 async function rpc(action, params = {}) {
   await connect()
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  state.ws.send(JSON.stringify({ jsonrpc: '2.0', id, action, params }))
+  const msg = { jsonrpc: '2.0', id, action, params }
+  // 如果已有 token，附带在请求中用于服务端鉴权
+  if (state.token) msg.token = state.token
+  state.ws.send(JSON.stringify(msg))
   return new Promise((resolve, reject) => {
     state.pending.set(id, { resolve, reject })
     setTimeout(() => {
@@ -181,6 +212,7 @@ async function login() {
   try {
     const result = await rpc('front.login', { password: state.password })
     state.token = result.token
+    localStorage.setItem('go-home-token', state.token)
     state.loggedIn = true
     await refreshAll()
     notify('登录成功')
@@ -442,6 +474,9 @@ function timeAgo(ts) {
   if (sec < 86400) return `${Math.floor(sec / 3600)}小时前`
   return `${Math.floor(sec / 86400)}天前`
 }
+
+// 页面加载时尝试恢复之前的登录会话
+tryRestoreSession()
 
 onBeforeUnmount(() => {
   clearTimeout(refreshTimer)

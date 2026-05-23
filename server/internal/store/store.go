@@ -657,6 +657,9 @@ ORDER BY d.last_online DESC
 		_ = note
 		devices = append(devices, d)
 	}
+	if devices == nil {
+		devices = []protocol.Device{}
+	}
 	return devices, rows.Err()
 }
 
@@ -697,6 +700,9 @@ func (s *Store) listFamilyBlacklist(familyID int64) ([]string, error) {
 			return nil, err
 		}
 		ids = append(ids, id)
+	}
+	if ids == nil {
+		ids = []string{}
 	}
 	return ids, rows.Err()
 }

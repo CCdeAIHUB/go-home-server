@@ -754,21 +754,32 @@ func (h *Hub) latencyPong(s *Session, env protocol.Envelope) protocol.Envelope {
 // ============================================================
 
 // requireAdmin 校验管理员权限后执行回调函数。
-// 仅当会话类型为 web-console 且 token 匹配时允许执行。
+// 支持两种鉴权方式：
+//  1. 当前会话已通过 front.login 认证（s.kind == console 且 s.token 匹配）
+//  2. 请求消息中携带了有效的 token（用于页面刷新后 WebSocket 重连时恢复会话）
 func (h *Hub) requireAdmin(s *Session, env protocol.Envelope, fn func() (any, error)) protocol.Envelope {
-	if s.kind != protocol.DeviceTypeConsole {
-		return protocol.Error(env.ID, "unauthorized", "admin login required")
-	}
-	// 校验管理员 token，防止会话伪造
 	h.mu.RLock()
 	expectedToken := ""
 	if h.admin != nil {
 		expectedToken = h.admin.token
 	}
 	h.mu.RUnlock()
-	if s.token != expectedToken || s.token == "" {
-		return protocol.Error(env.ID, "unauthorized", "invalid admin session token")
+
+	// 方式1：当前 session 已登录
+	sessionValid := s.kind == protocol.DeviceTypeConsole && s.token != "" && s.token == expectedToken
+	// 方式2：消息中携带了有效 token（页面刷新重连场景）
+	tokenValid := env.Token != "" && env.Token == expectedToken
+
+	if !sessionValid && !tokenValid {
+		return protocol.Error(env.ID, "unauthorized", "admin login required")
 	}
+
+	// 如果是通过消息 token 验证的，将此 session 也标记为管理员
+	if tokenValid && !sessionValid {
+		s.kind = protocol.DeviceTypeConsole
+		s.token = env.Token
+	}
+
 	result, err := fn()
 	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
