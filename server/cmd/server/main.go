@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -30,6 +31,17 @@ import (
 
 func main() {
 	cfg := config.Load()
+
+	// 命令行参数覆盖环境变量配置
+	addr := flag.String("addr", cfg.Addr, "HTTP listen address")
+	dbPath := flag.String("db", cfg.DBPath, "SQLite database path")
+	webDist := flag.String("web-dist", cfg.WebDist, "Web console static files directory")
+	flag.Parse()
+
+	cfg.Addr = *addr
+	cfg.DBPath = *dbPath
+	cfg.WebDist = *webDist
+
 	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil {
 		log.Fatalf("create data directory: %v", err)
 	}
