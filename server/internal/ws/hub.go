@@ -548,6 +548,11 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	h.store.AddLog("info", "device", "设备上线: "+params.DeviceID+" ("+params.DeviceType+")")
 	h.dataChanged("device.auth")
 
+	// 家庭服务器上线时，通知所有有权限的客户端刷新家庭列表
+	if params.DeviceType == protocol.DeviceTypeHomeServer {
+		go h.notifyHomeServerChanged(params.DeviceID, true)
+	}
+
 	return protocol.Result(env.ID, protocol.DeviceAuthResult{
 		Token:         token,
 		ServerNow:     time.Now(),
@@ -687,6 +692,7 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		Endpoint:         peerEndpoint(s),
 		ObservedEndpoint: s.observedEndpoint,
 		UDPPort:          s.udpPort,
+		RemoteAddr:       s.remote,
 		PublicKey:        s.publicKey,
 	}
 	server := protocol.PeerCandidate{
@@ -694,6 +700,7 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		Endpoint:         peerEndpoint(homeSession),
 		ObservedEndpoint: homeSession.observedEndpoint,
 		UDPPort:          homeSession.udpPort,
+		RemoteAddr:       homeSession.remote,
 		LANCIDR:          home.LANCIDR,
 		PublicKey:        homeSession.publicKey,
 	}
@@ -838,6 +845,10 @@ func (h *Hub) closeSession(s *Session) {
 	if deviceID != "" {
 		h.store.AddLog("info", "device", "设备离线: "+deviceID+" ("+kind+")")
 		h.dataChanged("device.offline")
+		// 家庭服务器离线时，通知所有有权限的客户端刷新家庭列表
+		if kind == protocol.DeviceTypeHomeServer {
+			go h.notifyHomeServerChanged(deviceID, false)
+		}
 	}
 }
 
@@ -968,6 +979,59 @@ func (h *Hub) familyLANChanged(homeServerID, cidr string) {
 		}
 		if allowed {
 			session.write(event)
+		}
+	}
+}
+
+// notifyHomeServerChanged 在家庭服务器上线或离线时通知所有有权限的客户端。
+func (h *Hub) notifyHomeServerChanged(homeServerID string, online bool) {
+	families, err := h.store.ListFamilies()
+	if err != nil {
+		log.Printf("list families for home server change: %v", err)
+		return
+	}
+	// 找到该 home-server 关联的所有 family
+	type familyChange struct {
+		FamilyID     int64
+		HomeServerID string
+	}
+	var changes []familyChange
+	for _, f := range families {
+		if f.HomeServerID == homeServerID {
+			changes = append(changes, familyChange{FamilyID: f.ID, HomeServerID: homeServerID})
+		}
+	}
+	if len(changes) == 0 {
+		return
+	}
+
+	// 收集所有在线客户端
+	h.mu.RLock()
+	sessions := make([]*Session, 0, len(h.devices))
+	for _, session := range h.devices {
+		if session.kind == protocol.DeviceTypeClient {
+			sessions = append(sessions, session)
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, change := range changes {
+		event, err := protocol.Event(protocol.EventFamilyHomeServerChanged, map[string]any{
+			"family_id":      change.FamilyID,
+			"home_server_id": change.HomeServerID,
+			"online":         online,
+		})
+		if err != nil {
+			continue
+		}
+		for _, session := range sessions {
+			allowed, err := h.store.CanDeviceAccessFamily(session.deviceID, change.FamilyID)
+			if err != nil {
+				continue
+			}
+			if allowed {
+				session.write(event)
+			}
 		}
 	}
 }
