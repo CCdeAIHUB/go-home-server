@@ -44,6 +44,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       packages: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - name: Log in to GitHub Container Registry
@@ -62,7 +63,7 @@ jobs:
             type=semver,pattern={{version}}
             type=sha
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: server/Dockerfile
