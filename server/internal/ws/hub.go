@@ -20,6 +20,7 @@ import (
 	"gohome/server/internal/store"
 	"gohome/shared/protocol"
 	"gohome/shared/security"
+	"gohome/shared/tunnel"
 )
 
 // Hub 是 WebSocket 连接的中心管理器，维护所有活跃会话。
@@ -32,6 +33,9 @@ type Hub struct {
 	started time.Time
 	// upgrader WebSocket 升级器。
 	upgrader websocket.Upgrader
+	// udpPort 公网服务器的 UDP 监听端口，0 表示未启用。
+	// 设备认证成功后会收到此端口，用于发送 UDP 注册探测包。
+	udpPort int
 
 	// mu 保护 admin 和 devices 的并发访问。
 	mu sync.RWMutex
@@ -62,6 +66,8 @@ type Session struct {
 	udpPort int
 	// remote 客户端远程地址（host:port），用于 P2P 端点推断。
 	remote string
+	// observedEndpoint 服务器通过 UDP 注册探测观察到的 NAT 映射公网端点（host:port）。
+	observedEndpoint string
 	// failures 连续 time_key 校验失败次数，达到 3 次强制断开连接。
 	failures int
 	// probes 延迟探测映射，key 为 probe_id，value 为发送时间。
@@ -71,7 +77,8 @@ type Session struct {
 }
 
 // NewHub 创建一个新的 Hub 实例并启动延迟探测循环。
-func NewHub(s *store.Store) *Hub {
+// udpPort 为公网服务器的 UDP 监听端口，0 表示未启用 UDP 端点发现。
+func NewHub(s *store.Store, udpPort int) *Hub {
 	h := &Hub{
 		store:   s,
 		started: time.Now(),
@@ -80,7 +87,8 @@ func NewHub(s *store.Store) *Hub {
 			// 生产环境应验证 Origin 头，防止 CSRF 攻击。
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
-		devices: map[string]*Session{},
+		udpPort:  udpPort,
+		devices:  map[string]*Session{},
 	}
 	go h.latencyProbeLoop()
 	return h
@@ -541,10 +549,11 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	h.dataChanged("device.auth")
 
 	return protocol.Result(env.ID, protocol.DeviceAuthResult{
-		Token:      token,
-		ServerNow:  time.Now(),
-		DeviceID:   params.DeviceID,
-		DeviceType: params.DeviceType,
+		Token:         token,
+		ServerNow:     time.Now(),
+		DeviceID:      params.DeviceID,
+		DeviceType:    params.DeviceType,
+		ServerUDPPort: h.udpPort,
 	})
 }
 
@@ -674,17 +683,19 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 
 	// 构建双方的连接信息
 	client := protocol.PeerCandidate{
-		DeviceID:  s.deviceID,
-		Endpoint:  peerEndpoint(s),
-		UDPPort:   s.udpPort,
-		PublicKey: s.publicKey,
+		DeviceID:         s.deviceID,
+		Endpoint:         peerEndpoint(s),
+		ObservedEndpoint: s.observedEndpoint,
+		UDPPort:          s.udpPort,
+		PublicKey:        s.publicKey,
 	}
 	server := protocol.PeerCandidate{
-		DeviceID:  home.DeviceID,
-		Endpoint:  peerEndpoint(homeSession),
-		UDPPort:   homeSession.udpPort,
-		LANCIDR:   home.LANCIDR,
-		PublicKey: homeSession.publicKey,
+		DeviceID:         home.DeviceID,
+		Endpoint:         peerEndpoint(homeSession),
+		ObservedEndpoint: homeSession.observedEndpoint,
+		UDPPort:          homeSession.udpPort,
+		LANCIDR:          home.LANCIDR,
+		PublicKey:        homeSession.publicKey,
 	}
 	offer := protocol.HolePunchOffer{
 		SessionID: sessionID,
@@ -1010,8 +1021,12 @@ func (h *Hub) sendLatencyProbe(s *Session) {
 }
 
 // peerEndpoint 从会话中提取 P2P 端点地址。
-// 优先使用 UDP 端口组合远程 IP，否则仅使用远程 IP。
+// 优先使用服务器观察到的 NAT 映射公网端点（通过 UDP 注册探测发现），
+// 其次使用 WebSocket 远程 IP 组合设备报告的 UDP 端口。
 func peerEndpoint(s *Session) string {
+	if s.observedEndpoint != "" {
+		return s.observedEndpoint
+	}
 	host, _, err := net.SplitHostPort(s.remote)
 	if err != nil {
 		host = s.remote
@@ -1025,4 +1040,62 @@ func peerEndpoint(s *Session) string {
 // ok 返回通用成功响应 {ok: true}。
 func ok() map[string]bool {
 	return map[string]bool{"ok": true}
+}
+
+// ServeUDP 处理 UDP 注册探测包，发现设备 NAT 映射后的公网端点。
+// 设备认证后应定期发送 GHU1 Register 包到此端口，服务器记录源地址。
+func (h *Hub) ServeUDP(conn net.PacketConn) {
+	buf := make([]byte, 64*1024)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			log.Printf("[udp] read error: %v", err)
+			return
+		}
+		packet := append([]byte(nil), buf[:n]...)
+		h.handleUDPPacket(packet, addr)
+	}
+}
+
+// handleUDPPacket 处理单个 UDP 数据包。
+func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) {
+	kind, err := tunnel.PacketKind(packet)
+	if err != nil {
+		return
+	}
+	if kind != tunnel.PacketRegister {
+		return
+	}
+	var reg tunnel.Register
+	if err := tunnel.UnmarshalControl(packet, &reg); err != nil {
+		return
+	}
+	if reg.DeviceID == "" || reg.Token == "" {
+		return
+	}
+	h.mu.RLock()
+	session := h.devices[reg.DeviceID]
+	h.mu.RUnlock()
+	if session == nil || session.token != reg.Token {
+		return
+	}
+	// 记录服务器观察到的 NAT 映射公网端点
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+	// 使用设备报告的 UDP 端口（而非源端口），因为 NAT 可能只映射 IP 不映射端口
+	// 如果源端口与设备报告端口不同（对称 NAT），则使用源端口
+	_, srcPortStr, _ := net.SplitHostPort(addr.String())
+	endpoint := addr.String()
+	if session.udpPort > 0 && srcPortStr != strconv.Itoa(session.udpPort) {
+		// NAT 映射端口与本地端口不同，使用观察到的完整端点
+		endpoint = net.JoinHostPort(host, srcPortStr)
+	} else if session.udpPort > 0 {
+		endpoint = net.JoinHostPort(host, strconv.Itoa(session.udpPort))
+	}
+	h.mu.Lock()
+	session.observedEndpoint = endpoint
+	h.mu.Unlock()
+	log.Printf("[udp] NAT endpoint for %s: %s (source=%s, local_port=%d)", reg.DeviceID, endpoint, addr.String(), session.udpPort)
 }

@@ -8,12 +8,17 @@
 //   - GO_HOME_DEFAULT_AUTH_CODE: 初始授权码（默认 "GOHOME-CHANGE-ME"，生产环境必须修改）
 package config
 
-import "os"
+import (
+	"os"
+	"strconv"
+)
 
 // Config 包含公网服务器的所有配置项。
 type Config struct {
 	// Addr HTTP 监听地址，格式为 "host:port"。
 	Addr string
+	// UDPPort UDP 监听端口，用于设备 NAT 端点发现。0 表示不启用。
+	UDPPort int
 	// DBPath SQLite 数据库文件路径。
 	DBPath string
 	// WebDist Web 控制台静态文件目录路径，为空则不提供 Web UI。
@@ -31,6 +36,7 @@ type Config struct {
 func Load() Config {
 	return Config{
 		Addr:                 env("GO_HOME_ADDR", ":8080"),
+		UDPPort:              envInt("GO_HOME_UDP_PORT", 8080),
 		DBPath:               env("GO_HOME_DB", "data/go-home.db"),
 		WebDist:              env("GO_HOME_WEB_DIST", ""),
 		DefaultAdminPassword: env("GO_HOME_DEFAULT_ADMIN_PASSWORD", "admin"),
@@ -42,6 +48,16 @@ func Load() Config {
 func env(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return fallback
+}
+
+// envInt 读取环境变量为整数，如果未设置或解析失败则返回 fallback。
+func envInt(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil {
+			return n
+		}
 	}
 	return fallback
 }

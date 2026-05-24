@@ -16,7 +16,9 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,11 +36,13 @@ func main() {
 
 	// 命令行参数覆盖环境变量配置
 	addr := flag.String("addr", cfg.Addr, "HTTP listen address")
+	udpPort := flag.Int("udp-port", cfg.UDPPort, "UDP listen port for NAT endpoint discovery (0 to disable)")
 	dbPath := flag.String("db", cfg.DBPath, "SQLite database path")
 	webDist := flag.String("web-dist", cfg.WebDist, "Web console static files directory")
 	flag.Parse()
 
 	cfg.Addr = *addr
+	cfg.UDPPort = *udpPort
 	cfg.DBPath = *dbPath
 	cfg.WebDist = *webDist
 
@@ -56,7 +60,19 @@ func main() {
 		log.Fatalf("init defaults: %v", err)
 	}
 
-	hub := ws.NewHub(db)
+	hub := ws.NewHub(db, cfg.UDPPort)
+
+	// 启动 UDP 监听（用于 NAT 端点发现）
+	if cfg.UDPPort > 0 {
+		udpConn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", cfg.UDPPort))
+		if err != nil {
+			log.Fatalf("UDP listen on port %d: %v", cfg.UDPPort, err)
+		}
+		defer udpConn.Close()
+		go hub.ServeUDP(udpConn)
+		log.Printf("UDP NAT discovery listening on :%d", cfg.UDPPort)
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/ws", hub)
 
