@@ -22,5 +22,5 @@ COPY --from=build /out/go-home-server /app/go-home-server
 COPY --from=web /src/web-console/dist /app/web-console
 ENV GO_HOME_ADDR=:8080
 ENV GO_HOME_WEB_DIST=/app/web-console
-EXPOSE 8080
+EXPOSE 8080/tcp 8080/udp
 ENTRYPOINT ["/app/go-home-server"]
