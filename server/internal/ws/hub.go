@@ -94,6 +94,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("upgrade websocket: %v", err)
 		return
 	}
+	log.Printf("[ws] new connection from %s", r.RemoteAddr)
 	session := &Session{conn: conn, remote: r.RemoteAddr}
 	defer h.closeSession(session)
 
@@ -113,6 +114,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // handle 将 JSON-RPC 请求路由到对应的处理函数。
 // 返回的 Envelope 作为响应发送回客户端。
 func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
+	if env.Action != "" {
+		log.Printf("[rpc] action=%s id=%s from=%s", env.Action, env.ID, s.deviceID)
+	}
 	switch env.Action {
 	// ===== 管理控制台操作（需要管理员登录）=====
 	case protocol.ActionFrontLogin:
@@ -263,7 +267,10 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 				return nil, err
 			}
 			h.markOnline(detail.Devices)
-			h.markFamilyOnline([]protocol.Family{detail.Family})
+			// 直接设置 HomeServerOnline，而非创建值拷贝切片
+			h.mu.RLock()
+			detail.Family.HomeServerOnline = h.devices[detail.Family.HomeServerID] != nil
+			h.mu.RUnlock()
 			return detail, nil
 		})
 	case protocol.ActionFrontFamilyTraffic:
@@ -310,7 +317,13 @@ func (h *Hub) handle(s *Session, env protocol.Envelope) protocol.Envelope {
 			if err != nil {
 				return nil, err
 			}
-			h.markOnline([]protocol.Device{detail.Device})
+			// 直接设置设备在线状态和延迟，而非创建值拷贝切片
+			h.mu.RLock()
+			if session := h.devices[detail.Device.DeviceID]; session != nil {
+				detail.Device.Online = true
+				detail.Device.LatencyMS = session.currentLatency()
+			}
+			h.mu.RUnlock()
 			h.markFamilyOnline(detail.Families)
 			return detail, nil
 		})
@@ -471,8 +484,10 @@ func (h *Hub) frontLogin(s *Session, env protocol.Envelope) protocol.Envelope {
 func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	params, err := protocol.DecodeParams[protocol.DeviceAuthParams](env.Params)
 	if err != nil {
+		log.Printf("[auth] decode error: %v", err)
 		return protocol.Error(env.ID, "bad_request", err.Error())
 	}
+	log.Printf("[auth] device=%s type=%s", params.DeviceID, params.DeviceType)
 	if params.DeviceID == "" || params.DeviceType == "" {
 		return protocol.Error(env.ID, "bad_request", "device_id and device_type are required")
 	}
@@ -492,12 +507,15 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 		return protocol.Error(env.ID, "internal_error", err.Error())
 	}
 	if params.AuthCode != authCode {
+		log.Printf("[auth] device=%s auth code mismatch", params.DeviceID)
 		return protocol.Error(env.ID, "unauthorized", "authorization code is incorrect")
 	}
 	// 校验 time_key（基于 SM3-HMAC 的时间窗口密钥，防重放攻击）
 	if reply := validateTimeKey(s, env.ID, authCode, params.TimeKey, params.Timestamp); reply != nil {
+		log.Printf("[auth] device=%s time_key validation failed", params.DeviceID)
 		return *reply
 	}
+	log.Printf("[auth] device=%s authenticated successfully", params.DeviceID)
 	token, err := security.NewToken(16)
 	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
@@ -797,6 +815,7 @@ func (h *Hub) closeSession(s *Session) {
 	_ = s.conn.Close()
 	deviceID := s.deviceID
 	kind := s.kind
+	log.Printf("[ws] connection closed: device=%s kind=%s", deviceID, kind)
 	h.mu.Lock()
 	if h.admin == s {
 		h.admin = nil
