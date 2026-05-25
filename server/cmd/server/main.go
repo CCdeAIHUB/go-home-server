@@ -37,6 +37,7 @@ func main() {
 	// 命令行参数覆盖环境变量配置
 	addr := flag.String("addr", cfg.Addr, "HTTP listen address")
 	udpPort := flag.Int("udp-port", cfg.UDPPort, "UDP listen port for NAT endpoint discovery (0 to disable)")
+	udpPortCount := flag.Int("udp-port-count", 8, "number of consecutive UDP discovery ports to listen on")
 	dbPath := flag.String("db", cfg.DBPath, "SQLite database path")
 	webDist := flag.String("web-dist", cfg.WebDist, "Web console static files directory")
 	flag.Parse()
@@ -60,17 +61,39 @@ func main() {
 		log.Fatalf("init defaults: %v", err)
 	}
 
-	hub := ws.NewHub(db, cfg.UDPPort)
-
+	var udpPorts []int
+	var udpConns []net.PacketConn
 	// 启动 UDP 监听（用于 NAT 端点发现）
 	if cfg.UDPPort > 0 {
-		udpConn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", cfg.UDPPort))
-		if err != nil {
-			log.Fatalf("UDP listen on port %d: %v", cfg.UDPPort, err)
+		count := *udpPortCount
+		if count < 1 {
+			count = 1
 		}
-		defer udpConn.Close()
+		if count > 32 {
+			count = 32
+		}
+		for i := 0; i < count && cfg.UDPPort+i <= 65535; i++ {
+			port := cfg.UDPPort + i
+			udpConn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+			if err != nil {
+				if i == 0 {
+					log.Fatalf("UDP listen on port %d: %v", port, err)
+				}
+				log.Printf("UDP NAT discovery port %d unavailable: %v", port, err)
+				continue
+			}
+			defer udpConn.Close()
+			udpPorts = append(udpPorts, port)
+			udpConns = append(udpConns, udpConn)
+		}
+	}
+
+	hub := ws.NewHub(db, udpPorts...)
+
+	for i, udpConn := range udpConns {
+		port := udpPorts[i]
 		go hub.ServeUDP(udpConn)
-		log.Printf("UDP NAT discovery listening on :%d", cfg.UDPPort)
+		log.Printf("UDP NAT discovery listening on :%d", port)
 	}
 
 	mux := http.NewServeMux()

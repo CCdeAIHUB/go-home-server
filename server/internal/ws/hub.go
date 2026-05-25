@@ -34,9 +34,10 @@ type Hub struct {
 	started time.Time
 	// upgrader WebSocket 升级器。
 	upgrader websocket.Upgrader
-	// udpPort 公网服务器的 UDP 监听端口，0 表示未启用。
-	// 设备认证成功后会收到此端口，用于发送 UDP 注册探测包。
+	// udpPort 公网服务器的主 UDP 监听端口，0 表示未启用。
 	udpPort int
+	// udpPorts 公网服务器的 UDP 观测端口列表。
+	udpPorts []int
 
 	// mu 保护 admin 和 devices 的并发访问。
 	mu sync.RWMutex
@@ -69,6 +70,8 @@ type Session struct {
 	remote string
 	// observedEndpoint 服务器通过 UDP 注册探测观察到的 NAT 映射公网端点（host:port）。
 	observedEndpoint string
+	// observedEndpoints 服务器通过多 UDP 观测端口收集到的 NAT 映射公网端点。
+	observedEndpoints []string
 	// failures 连续 time_key 校验失败次数，达到 3 次强制断开连接。
 	failures int
 	// probes 延迟探测映射，key 为 probe_id，value 为发送时间。
@@ -78,8 +81,13 @@ type Session struct {
 }
 
 // NewHub 创建一个新的 Hub 实例并启动延迟探测循环。
-// udpPort 为公网服务器的 UDP 监听端口，0 表示未启用 UDP 端点发现。
-func NewHub(s *store.Store, udpPort int) *Hub {
+// udpPorts 为公网服务器的 UDP 监听端口列表，空列表表示未启用 UDP 端点发现。
+func NewHub(s *store.Store, udpPorts ...int) *Hub {
+	ports := normalizeUDPPorts(udpPorts)
+	primaryPort := 0
+	if len(ports) > 0 {
+		primaryPort = ports[0]
+	}
 	h := &Hub{
 		store:   s,
 		started: time.Now(),
@@ -88,11 +96,25 @@ func NewHub(s *store.Store, udpPort int) *Hub {
 			// 生产环境应验证 Origin 头，防止 CSRF 攻击。
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
-		udpPort: udpPort,
-		devices: map[string]*Session{},
+		udpPort:  primaryPort,
+		udpPorts: ports,
+		devices:  map[string]*Session{},
 	}
 	go h.latencyProbeLoop()
 	return h
+}
+
+func normalizeUDPPorts(ports []int) []int {
+	out := make([]int, 0, len(ports))
+	seen := map[int]bool{}
+	for _, port := range ports {
+		if port < 1 || port > 65535 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		out = append(out, port)
+	}
+	return out
 }
 
 // ServeHTTP 处理 WebSocket 升级请求，进入消息读取循环。
@@ -539,6 +561,8 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	s.token = token
 	s.publicKey = params.PublicKey
 	s.udpPort = params.UDPPort
+	s.observedEndpoint = ""
+	s.observedEndpoints = nil
 	// 同一设备的新连接顶替旧连接（单设备单会话）
 	if old := h.devices[params.DeviceID]; old != nil && old != s {
 		_ = old.conn.Close()
@@ -555,11 +579,12 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	}
 
 	return protocol.Result(env.ID, protocol.DeviceAuthResult{
-		Token:         token,
-		ServerNow:     time.Now(),
-		DeviceID:      params.DeviceID,
-		DeviceType:    params.DeviceType,
-		ServerUDPPort: h.udpPort,
+		Token:          token,
+		ServerNow:      time.Now(),
+		DeviceID:       params.DeviceID,
+		DeviceType:     params.DeviceType,
+		ServerUDPPort:  h.udpPort,
+		ServerUDPPorts: append([]int(nil), h.udpPorts...),
 	})
 }
 
@@ -1121,6 +1146,9 @@ func peerCandidates(s *Session) []string {
 		out = append(out, normalized)
 	}
 
+	for _, endpoint := range s.observedEndpoints {
+		add(endpoint)
+	}
 	add(s.observedEndpoint)
 	if host, ok := endpointHost(s.observedEndpoint); ok && s.udpPort > 0 {
 		add(net.JoinHostPort(host, strconv.Itoa(s.udpPort)))
@@ -1215,6 +1243,29 @@ func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) {
 	}
 	h.mu.Lock()
 	session.observedEndpoint = endpoint
+	session.observedEndpoints = rememberObservedEndpoint(session.observedEndpoints, endpoint)
+	observedCount := len(session.observedEndpoints)
+	udpPort := session.udpPort
 	h.mu.Unlock()
-	log.Printf("[udp] NAT endpoint for %s: %s (source=%s, local_port=%d)", reg.DeviceID, endpoint, addr.String(), session.udpPort)
+	log.Printf("[udp] NAT endpoint for %s: %s (source=%s, local_port=%d, observed=%d)", reg.DeviceID, endpoint, addr.String(), udpPort, observedCount)
+}
+
+func rememberObservedEndpoint(endpoints []string, endpoint string) []string {
+	const maxObservedEndpoints = 48
+	capacity := len(endpoints) + 1
+	if capacity > maxObservedEndpoints {
+		capacity = maxObservedEndpoints
+	}
+	out := make([]string, 0, capacity)
+	out = append(out, endpoint)
+	for _, existing := range endpoints {
+		if existing == endpoint {
+			continue
+		}
+		out = append(out, existing)
+		if len(out) >= maxObservedEndpoints {
+			break
+		}
+	}
+	return out
 }
