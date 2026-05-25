@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,8 +88,8 @@ func NewHub(s *store.Store, udpPort int) *Hub {
 			// 生产环境应验证 Origin 头，防止 CSRF 攻击。
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
-		udpPort:  udpPort,
-		devices:  map[string]*Session{},
+		udpPort: udpPort,
+		devices: map[string]*Session{},
 	}
 	go h.latencyProbeLoop()
 	return h
@@ -661,6 +662,9 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 	if err != nil {
 		return protocol.Error(env.ID, "bad_request", err.Error())
 	}
+	if params.ClientUDPPort > 0 {
+		s.udpPort = params.ClientUDPPort
+	}
 	allowed, err := h.store.CanDeviceAccessFamily(s.deviceID, params.FamilyID)
 	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
@@ -691,6 +695,7 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		DeviceID:         s.deviceID,
 		Endpoint:         peerEndpoint(s),
 		ObservedEndpoint: s.observedEndpoint,
+		Candidates:       peerCandidates(s),
 		UDPPort:          s.udpPort,
 		RemoteAddr:       s.remote,
 		PublicKey:        s.publicKey,
@@ -699,10 +704,17 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		DeviceID:         home.DeviceID,
 		Endpoint:         peerEndpoint(homeSession),
 		ObservedEndpoint: homeSession.observedEndpoint,
+		Candidates:       peerCandidates(homeSession),
 		UDPPort:          homeSession.udpPort,
 		RemoteAddr:       homeSession.remote,
 		LANCIDR:          home.LANCIDR,
 		PublicKey:        homeSession.publicKey,
+	}
+	if len(client.Candidates) == 0 {
+		return protocol.Error(env.ID, "not_available", "client has no usable IPv4 UDP candidate")
+	}
+	if len(server.Candidates) == 0 {
+		return protocol.Error(env.ID, "not_available", "home server has no usable IPv4 UDP candidate")
 	}
 	offer := protocol.HolePunchOffer{
 		SessionID: sessionID,
@@ -1084,21 +1096,75 @@ func (h *Hub) sendLatencyProbe(s *Session) {
 	s.write(event)
 }
 
-// peerEndpoint 从会话中提取 P2P 端点地址。
-// 优先使用服务器观察到的 NAT 映射公网端点（通过 UDP 注册探测发现），
-// 其次使用 WebSocket 远程 IP 组合设备报告的 UDP 端口。
+// peerEndpoint returns the preferred IPv4 UDP endpoint for a session.
 func peerEndpoint(s *Session) string {
-	if s.observedEndpoint != "" {
-		return s.observedEndpoint
+	candidates := peerCandidates(s)
+	if len(candidates) == 0 {
+		return ""
 	}
-	host, _, err := net.SplitHostPort(s.remote)
+	return candidates[0]
+}
+
+// peerCandidates builds ordered, deduplicated IPv4 endpoints for direct UDP punching.
+func peerCandidates(s *Session) []string {
+	if s == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(endpoint string) {
+		normalized, ok := normalizeIPv4Endpoint(endpoint)
+		if !ok || seen[normalized] {
+			return
+		}
+		seen[normalized] = true
+		out = append(out, normalized)
+	}
+
+	add(s.observedEndpoint)
+	if host, ok := endpointHost(s.observedEndpoint); ok && s.udpPort > 0 {
+		add(net.JoinHostPort(host, strconv.Itoa(s.udpPort)))
+	}
+	if host, ok := endpointHost(s.remote); ok && s.udpPort > 0 {
+		add(net.JoinHostPort(host, strconv.Itoa(s.udpPort)))
+	}
+	return out
+}
+
+func endpointHost(endpoint string) (string, bool) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", false
+	}
+	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		host = s.remote
+		host = endpoint
 	}
-	if s.udpPort <= 0 {
-		return host
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil || ip.To4() == nil {
+		return "", false
 	}
-	return net.JoinHostPort(host, strconv.Itoa(s.udpPort))
+	return ip.To4().String(), true
+}
+
+func normalizeIPv4Endpoint(endpoint string) (string, bool) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", false
+	}
+	host, portText, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", false
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil || ip.To4() == nil {
+		return "", false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort(ip.To4().String(), strconv.Itoa(port)), true
 }
 
 // ok 返回通用成功响应 {ok: true}。
@@ -1143,20 +1209,9 @@ func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) {
 	if session == nil || session.token != reg.Token {
 		return
 	}
-	// 记录服务器观察到的 NAT 映射公网端点
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		host = addr.String()
-	}
-	// 使用设备报告的 UDP 端口（而非源端口），因为 NAT 可能只映射 IP 不映射端口
-	// 如果源端口与设备报告端口不同（对称 NAT），则使用源端口
-	_, srcPortStr, _ := net.SplitHostPort(addr.String())
-	endpoint := addr.String()
-	if session.udpPort > 0 && srcPortStr != strconv.Itoa(session.udpPort) {
-		// NAT 映射端口与本地端口不同，使用观察到的完整端点
-		endpoint = net.JoinHostPort(host, srcPortStr)
-	} else if session.udpPort > 0 {
-		endpoint = net.JoinHostPort(host, strconv.Itoa(session.udpPort))
+	endpoint, ok := normalizeIPv4Endpoint(addr.String())
+	if !ok {
+		return
 	}
 	h.mu.Lock()
 	session.observedEndpoint = endpoint
