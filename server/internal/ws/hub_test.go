@@ -61,10 +61,13 @@ func TestHandleUDPPacketRecordsObservedSourceEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hub.handleUDPPacket(packet, &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 62000})
+	ack := hub.handleUDPPacket(packet, &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 62000})
 
 	if session.observedEndpoint != "203.0.113.20:62000" {
 		t.Fatalf("observed endpoint got %q", session.observedEndpoint)
+	}
+	if ack == nil || ack.ObservedEndpoint != "203.0.113.20:62000" {
+		t.Fatalf("register ack got %+v", ack)
 	}
 	got := peerCandidates(session)
 	want := []string{"203.0.113.20:62000", "203.0.113.20:47777"}

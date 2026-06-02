@@ -45,6 +45,15 @@ type Hub struct {
 	admin *Session
 	// devices 在线设备会话映射，key 为 device_id。
 	devices map[string]*Session
+	// punches 保存短期活跃打洞会话，用于实时转发新发现的候选端点。
+	punches map[string]punchAssist
+}
+
+type punchAssist struct {
+	sessionID string
+	clientID  string
+	homeID    string
+	expiresAt time.Time
 }
 
 // Session 表示一个 WebSocket 连接会话。
@@ -99,6 +108,7 @@ func NewHub(s *store.Store, udpPorts ...int) *Hub {
 		udpPort:  primaryPort,
 		udpPorts: ports,
 		devices:  map[string]*Session{},
+		punches:  map[string]punchAssist{},
 	}
 	go h.latencyProbeLoop()
 	return h
@@ -748,6 +758,14 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 		Client:    client,
 		Server:    server,
 	}
+	h.mu.Lock()
+	h.punches[sessionID] = punchAssist{
+		sessionID: sessionID,
+		clientID:  s.deviceID,
+		homeID:    home.DeviceID,
+		expiresAt: time.Now().Add(90 * time.Second),
+	}
+	h.mu.Unlock()
 	// 将打洞邀请转发给家庭服务器
 	if event, err := protocol.Event(protocol.EventP2PHolePunchOffer, offer); err == nil {
 		homeSession.write(event)
@@ -1211,43 +1229,110 @@ func (h *Hub) ServeUDP(conn net.PacketConn) {
 			return
 		}
 		packet := append([]byte(nil), buf[:n]...)
-		h.handleUDPPacket(packet, addr)
+		ack := h.handleUDPPacket(packet, addr)
+		if ack == nil {
+			continue
+		}
+		reply, err := tunnel.MarshalRegisterAck(*ack)
+		if err != nil {
+			log.Printf("[udp] marshal register ack: %v", err)
+			continue
+		}
+		if _, err := conn.WriteTo(reply, addr); err != nil {
+			log.Printf("[udp] write register ack to %s: %v", addr.String(), err)
+		}
 	}
 }
 
 // handleUDPPacket 处理单个 UDP 数据包。
-func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) {
+func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) *tunnel.RegisterAck {
 	kind, err := tunnel.PacketKind(packet)
 	if err != nil {
-		return
+		return nil
 	}
 	if kind != tunnel.PacketRegister {
-		return
+		return nil
 	}
 	var reg tunnel.Register
 	if err := tunnel.UnmarshalControl(packet, &reg); err != nil {
-		return
+		return nil
 	}
 	if reg.DeviceID == "" || reg.Token == "" {
-		return
+		return nil
 	}
 	h.mu.RLock()
 	session := h.devices[reg.DeviceID]
 	h.mu.RUnlock()
 	if session == nil || session.token != reg.Token {
-		return
+		return nil
 	}
 	endpoint, ok := normalizeIPv4Endpoint(addr.String())
 	if !ok {
-		return
+		return nil
 	}
 	h.mu.Lock()
+	isNew := !containsEndpoint(session.observedEndpoints, endpoint)
 	session.observedEndpoint = endpoint
 	session.observedEndpoints = rememberObservedEndpoint(session.observedEndpoints, endpoint)
 	observedCount := len(session.observedEndpoints)
 	udpPort := session.udpPort
+	notifications := h.candidateNotificationsLocked(reg.DeviceID, endpoint, isNew)
 	h.mu.Unlock()
 	log.Printf("[udp] NAT endpoint for %s: %s (source=%s, local_port=%d, observed=%d)", reg.DeviceID, endpoint, addr.String(), udpPort, observedCount)
+	for _, notification := range notifications {
+		notification.target.write(notification.event)
+	}
+	return &tunnel.RegisterAck{ObservedEndpoint: endpoint}
+}
+
+type candidateNotification struct {
+	target *Session
+	event  protocol.Envelope
+}
+
+func (h *Hub) candidateNotificationsLocked(deviceID, endpoint string, isNew bool) []candidateNotification {
+	if !isNew {
+		return nil
+	}
+	now := time.Now()
+	var notifications []candidateNotification
+	for sessionID, assist := range h.punches {
+		if now.After(assist.expiresAt) {
+			delete(h.punches, sessionID)
+			continue
+		}
+		targetID := ""
+		switch deviceID {
+		case assist.clientID:
+			targetID = assist.homeID
+		case assist.homeID:
+			targetID = assist.clientID
+		default:
+			continue
+		}
+		target := h.devices[targetID]
+		if target == nil {
+			continue
+		}
+		event, err := protocol.Event(protocol.EventP2PCandidate, map[string]any{
+			"from_device_id": deviceID,
+			"candidate":      endpoint,
+			"session_id":     sessionID,
+		})
+		if err == nil {
+			notifications = append(notifications, candidateNotification{target: target, event: event})
+		}
+	}
+	return notifications
+}
+
+func containsEndpoint(endpoints []string, endpoint string) bool {
+	for _, existing := range endpoints {
+		if existing == endpoint {
+			return true
+		}
+	}
+	return false
 }
 
 func rememberObservedEndpoint(endpoints []string, endpoint string) []string {
