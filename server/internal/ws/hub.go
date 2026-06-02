@@ -1278,7 +1278,9 @@ func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) *tunnel.RegisterAck 
 	udpPort := session.udpPort
 	notifications := h.candidateNotificationsLocked(reg.DeviceID, endpoint, isNew)
 	h.mu.Unlock()
-	log.Printf("[udp] NAT endpoint for %s: %s (source=%s, local_port=%d, observed=%d)", reg.DeviceID, endpoint, addr.String(), udpPort, observedCount)
+	if isNew {
+		log.Printf("[udp] NAT endpoint for %s: %s (source=%s, local_port=%d, observed=%d)", reg.DeviceID, endpoint, addr.String(), udpPort, observedCount)
+	}
 	for _, notification := range notifications {
 		notification.target.write(notification.event)
 	}
