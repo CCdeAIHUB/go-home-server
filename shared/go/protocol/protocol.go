@@ -391,6 +391,8 @@ type HolePunchRequestParams struct {
 	FamilyID int64 `json:"family_id"`
 	// ClientUDPPort 客户端监听的 UDP 端口。
 	ClientUDPPort int `json:"client_udp_port"`
+	// ClientUDPPorts is the full set of UDP sockets prepared for punching.
+	ClientUDPPorts []int `json:"client_udp_ports,omitempty"`
 	// PreferredMode 首选网络模式："real"（真实同网段）或 "virtual"（虚拟映射），默认 "real"。
 	PreferredMode string `json:"preferred_mode,omitempty"`
 	// VirtualCIDR 客户端期望的虚拟 CIDR（当选择虚拟模式时使用）。

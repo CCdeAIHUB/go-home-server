@@ -75,6 +75,8 @@ type Session struct {
 	publicKey string
 	// udpPort 设备监听的 UDP 端口，用于 P2P 打洞。
 	udpPort int
+	// udpPorts 设备为本轮 P2P 打洞准备的 UDP 端口集合。
+	udpPorts []int
 	// remote 客户端远程地址（host:port），用于 P2P 端点推断。
 	remote string
 	// observedEndpoint 服务器通过 UDP 注册探测观察到的 NAT 映射公网端点（host:port）。
@@ -571,6 +573,7 @@ func (h *Hub) deviceAuth(s *Session, env protocol.Envelope) protocol.Envelope {
 	s.token = token
 	s.publicKey = params.PublicKey
 	s.udpPort = params.UDPPort
+	s.udpPorts = normalizeDeviceUDPPorts(nil, params.UDPPort)
 	s.observedEndpoint = ""
 	s.observedEndpoints = nil
 	// 同一设备的新连接顶替旧连接（单设备单会话）
@@ -700,6 +703,7 @@ func (h *Hub) holePunchRequest(s *Session, env protocol.Envelope) protocol.Envel
 	if params.ClientUDPPort > 0 {
 		s.udpPort = params.ClientUDPPort
 	}
+	s.udpPorts = normalizeDeviceUDPPorts(params.ClientUDPPorts, s.udpPort)
 	allowed, err := h.store.CanDeviceAccessFamily(s.deviceID, params.FamilyID)
 	if err != nil {
 		return protocol.Error(env.ID, "internal_error", err.Error())
@@ -1168,13 +1172,55 @@ func peerCandidates(s *Session) []string {
 		add(endpoint)
 	}
 	add(s.observedEndpoint)
-	if host, ok := endpointHost(s.observedEndpoint); ok && s.udpPort > 0 {
-		add(net.JoinHostPort(host, strconv.Itoa(s.udpPort)))
-	}
-	if host, ok := endpointHost(s.remote); ok && s.udpPort > 0 {
-		add(net.JoinHostPort(host, strconv.Itoa(s.udpPort)))
+	for _, host := range peerCandidateHosts(s) {
+		for _, port := range peerCandidatePorts(s) {
+			add(net.JoinHostPort(host, strconv.Itoa(port)))
+		}
 	}
 	return out
+}
+
+func normalizeDeviceUDPPorts(ports []int, primary int) []int {
+	out := make([]int, 0, len(ports)+1)
+	seen := map[int]bool{}
+	add := func(port int) {
+		if port < 1 || port > 65535 || seen[port] {
+			return
+		}
+		seen[port] = true
+		out = append(out, port)
+	}
+	add(primary)
+	for _, port := range ports {
+		add(port)
+	}
+	return out
+}
+
+func peerCandidatePorts(s *Session) []int {
+	if len(s.udpPorts) > 0 {
+		return s.udpPorts
+	}
+	return normalizeDeviceUDPPorts(nil, s.udpPort)
+}
+
+func peerCandidateHosts(s *Session) []string {
+	hosts := make([]string, 0, len(s.observedEndpoints)+2)
+	seen := map[string]bool{}
+	add := func(endpoint string) {
+		host, ok := endpointHost(endpoint)
+		if !ok || seen[host] {
+			return
+		}
+		seen[host] = true
+		hosts = append(hosts, host)
+	}
+	for _, endpoint := range s.observedEndpoints {
+		add(endpoint)
+	}
+	add(s.observedEndpoint)
+	add(s.remote)
+	return hosts
 }
 
 func endpointHost(endpoint string) (string, bool) {
