@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   ArrowLeft,
   Ban,
@@ -13,11 +13,13 @@ import {
   LogIn,
   LogOut,
   Monitor,
+  Moon,
   Plus,
   Search,
   Router,
   Settings,
   Shield,
+  Sun,
   Smartphone,
   Trash2,
   Users,
@@ -71,7 +73,35 @@ const state = reactive({
 })
 
 const loading = ref(false)
+const theme = ref('system')
+const activeTheme = ref('light')
 let refreshTimer = null
+
+function applyTheme(value) {
+  const root = document.documentElement
+  activeTheme.value = value === 'system'
+    ? (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+    : value
+  root.dataset.theme = activeTheme.value
+}
+
+function setTheme(value) {
+  theme.value = value
+  localStorage.setItem('go-home-console-theme', value)
+  applyTheme(value)
+}
+
+function toggleTheme() {
+  setTheme(activeTheme.value === 'dark' ? 'light' : 'dark')
+}
+
+onMounted(() => {
+  theme.value = localStorage.getItem('go-home-console-theme') || 'system'
+  applyTheme(theme.value)
+  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (theme.value === 'system') applyTheme('system')
+  })
+})
 
 const onlineHomeServers = computed(() =>
   state.devices.filter((device) => device.device_type === 'home-server' && device.online && !device.family_id)
@@ -493,6 +523,10 @@ onBeforeUnmount(() => {
     </div>
 
     <section v-if="!state.loggedIn" class="login-panel">
+      <button class="theme-toggle floating" type="button" :title="activeTheme === 'dark' ? '切换浅色模式' : '切换深色模式'" @click="toggleTheme">
+        <Sun v-if="activeTheme === 'dark'" :size="18" />
+        <Moon v-else :size="18" />
+      </button>
       <div class="brand-row">
         <Shield :size="30" />
         <div>
@@ -520,6 +554,11 @@ onBeforeUnmount(() => {
           <strong>Go Home</strong>
         </div>
         <nav>
+          <button class="theme-toggle" type="button" @click="toggleTheme">
+            <Sun v-if="activeTheme === 'dark'" :size="18" />
+            <Moon v-else :size="18" />
+            {{ activeTheme === 'dark' ? '浅色' : '深色' }}
+          </button>
           <button
             v-for="tab in tabs"
             :key="tab.id"
