@@ -1317,6 +1317,10 @@ func (h *Hub) handleUDPPacket(packet []byte, addr net.Addr) *tunnel.RegisterAck 
 		return nil
 	}
 	h.mu.Lock()
+	if reg.UDPPort > 0 {
+		session.udpPort = reg.UDPPort
+		session.udpPorts = normalizeDeviceUDPPorts(session.udpPorts, session.udpPort)
+	}
 	isNew := !containsEndpoint(session.observedEndpoints, endpoint)
 	session.observedEndpoint = endpoint
 	session.observedEndpoints = rememberObservedEndpoint(session.observedEndpoints, endpoint)

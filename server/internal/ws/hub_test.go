@@ -56,7 +56,7 @@ func TestPeerCandidatesPreferObservedAndFilterIPv6(t *testing.T) {
 func TestHandleUDPPacketRecordsObservedSourceEndpoint(t *testing.T) {
 	session := &Session{deviceID: "device-1", token: "token-1", udpPort: 47777}
 	hub := &Hub{devices: map[string]*Session{"device-1": session}}
-	packet, err := tunnel.MarshalRegister(tunnel.Register{DeviceID: "device-1", Token: "token-1"})
+	packet, err := tunnel.MarshalRegister(tunnel.Register{DeviceID: "device-1", Token: "token-1", UDPPort: 48888})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,8 +69,11 @@ func TestHandleUDPPacketRecordsObservedSourceEndpoint(t *testing.T) {
 	if ack == nil || ack.ObservedEndpoint != "203.0.113.20:62000" {
 		t.Fatalf("register ack got %+v", ack)
 	}
+	if session.udpPort != 48888 {
+		t.Fatalf("udp port got %d", session.udpPort)
+	}
 	got := peerCandidates(session)
-	want := []string{"203.0.113.20:62000", "203.0.113.20:47777"}
+	want := []string{"203.0.113.20:62000", "203.0.113.20:48888"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("peerCandidates got %#v want %#v", got, want)
 	}
