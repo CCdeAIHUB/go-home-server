@@ -76,6 +76,8 @@ const loading = ref(false)
 const theme = ref('system')
 const activeTheme = ref('light')
 let refreshTimer = null
+let themeMediaQuery = null
+let themeMediaHandler = null
 
 function applyTheme(value) {
   const root = document.documentElement
@@ -98,9 +100,15 @@ function toggleTheme() {
 onMounted(() => {
   theme.value = localStorage.getItem('go-home-console-theme') || 'system'
   applyTheme(theme.value)
-  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  themeMediaQuery = window.matchMedia?.('(prefers-color-scheme: dark)')
+  themeMediaHandler = () => {
     if (theme.value === 'system') applyTheme('system')
-  })
+  }
+  if (themeMediaQuery?.addEventListener) {
+    themeMediaQuery.addEventListener('change', themeMediaHandler)
+  } else if (themeMediaQuery?.addListener) {
+    themeMediaQuery.addListener(themeMediaHandler)
+  }
 })
 
 const onlineHomeServers = computed(() =>
@@ -510,6 +518,11 @@ tryRestoreSession()
 
 onBeforeUnmount(() => {
   clearTimeout(refreshTimer)
+  if (themeMediaQuery?.removeEventListener && themeMediaHandler) {
+    themeMediaQuery.removeEventListener('change', themeMediaHandler)
+  } else if (themeMediaQuery?.removeListener && themeMediaHandler) {
+    themeMediaQuery.removeListener(themeMediaHandler)
+  }
   if (state.ws) state.ws.close()
 })
 </script>
