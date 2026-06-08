@@ -21,3 +21,25 @@ go run ./cmd/server
 - `GO_HOME_DEFAULT_ADMIN_PASSWORD`
 - `GO_HOME_DEFAULT_AUTH_CODE`
 
+## 部署方式
+
+### Docker Compose
+
+```bash
+GO_HOME_DEFAULT_ADMIN_PASSWORD='change-me' \
+GO_HOME_DEFAULT_AUTH_CODE='change-me' \
+docker compose up -d --build
+```
+
+### Linux systemd
+
+先从 GitHub Actions 或 Release 下载 `go-home-server` 二进制文件，然后执行：
+
+```bash
+sudo GO_HOME_SERVER_BINARY_URL="https://example.com/go-home-server" \
+  GO_HOME_DEFAULT_ADMIN_PASSWORD='change-me' \
+  GO_HOME_DEFAULT_AUTH_CODE='change-me' \
+  sh scripts/install-linux.sh
+```
+
+未设置 `GO_HOME_SERVER_BINARY_URL` 时，脚本会使用当前目录下的 `./go-home-server`。
