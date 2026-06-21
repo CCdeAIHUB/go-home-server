@@ -11,7 +11,25 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.1"
+      - run: go work sync
+      - run: go test ./...
+        working-directory: shared/go
+      - run: go test ./...
+        working-directory: server
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,21 +40,24 @@ jobs:
         with:
           node-version: "24"
       - run: go work sync
-      - run: go test ./...
-        working-directory: shared/go
-      - run: go test ./...
-        working-directory: server
       - run: npm ci
         working-directory: web-console
       - run: npm run build
         working-directory: web-console
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o go-home-server ./cmd/server
         working-directory: server
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o go-home-server-arm64 ./cmd/server
+        working-directory: server
       - name: Upload server binary
         uses: actions/upload-artifact@v4
         with:
           name: go-home-server-linux-amd64
           path: server/go-home-server
+      - name: Upload server binary arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-home-server-linux-arm64
+          path: server/go-home-server-arm64
 
   docker:
     needs: build

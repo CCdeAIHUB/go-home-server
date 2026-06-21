@@ -1,45 +1,55 @@
-# 公网服务器
+# Server Binary
 
-公网服务器提供：
+This directory contains the Go Home public server backend.
 
-- `/ws` WebSocket JSON-RPC API。
-- Vue3 Web 控制台静态文件托管。
-- SQLite 数据库存储。
-- 设备状态、家庭管理、P2P 信令协调。
+## Run From Source
 
-启动：
-
-```powershell
-go run ./cmd/server
-```
-
-常用环境变量：
-
-- `GO_HOME_ADDR`
-- `GO_HOME_DB`
-- `GO_HOME_WEB_DIST`
-- `GO_HOME_DEFAULT_ADMIN_PASSWORD`
-- `GO_HOME_DEFAULT_AUTH_CODE`
-
-## 部署方式
-
-### Docker Compose
+Build the web console first:
 
 ```bash
-GO_HOME_DEFAULT_ADMIN_PASSWORD='change-me' \
-GO_HOME_DEFAULT_AUTH_CODE='change-me' \
-docker compose up -d --build
+cd ../web-console
+npm ci
+npm run build
 ```
 
-### Linux systemd
-
-先从 GitHub Actions 或 Release 下载 `go-home-server` 二进制文件，然后执行：
+Run the server:
 
 ```bash
-sudo GO_HOME_SERVER_BINARY_URL="https://example.com/go-home-server" \
-  GO_HOME_DEFAULT_ADMIN_PASSWORD='change-me' \
-  GO_HOME_DEFAULT_AUTH_CODE='change-me' \
-  sh scripts/install-linux.sh
+cd ../server
+GO_HOME_WEB_DIST=../web-console/dist go run ./cmd/server
 ```
 
-未设置 `GO_HOME_SERVER_BINARY_URL` 时，脚本会使用当前目录下的 `./go-home-server`。
+Open:
+
+```text
+http://YOUR_SERVER_IP:8080/
+```
+
+## Production Install
+
+For normal deployment, use the repository-level install docs:
+
+- Docker Compose: `docker compose up -d --build`
+- Linux systemd: `scripts/install-linux.sh`
+
+## Common Errors
+
+Page says only `Go Home server is running`:
+
+- `GO_HOME_WEB_DIST` is missing or points to the wrong directory.
+- Rebuild `web-console` and restart the server.
+
+Login fails:
+
+- Confirm the admin password.
+- If this is first boot, change `GO_HOME_DEFAULT_ADMIN_PASSWORD` before exposing the service.
+
+Clients cannot connect:
+
+- Open TCP `8080`.
+- Open UDP `8080`.
+- Confirm clients use the same authorization code.
+
+## Security
+
+Do not commit real admin passwords, authorization codes, SSH credentials, private keys, or personal server IP addresses.
